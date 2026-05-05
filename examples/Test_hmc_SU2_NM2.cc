@@ -41,14 +41,12 @@ directory
 using namespace Grid;
 
 //typedef GenericHMCRunner<MinimumNorm2> HMCWrapper;
-// using GimplHMC = PeriodicGaugeImpl<GaugeImplTypes<vComplexD, 2>>;
-// using RepsHMC  = Representations<FundamentalRep<2, GroupName::SU>>;
-// using HMCWrapper = HMCWrapperTemplate<GimplHMC, MinimumNorm2, RepsHMC, XmlReader>;
-
-typedef PeriodicGimplR Gimpl;
+using GimplHMC = PeriodicGaugeImpl<GaugeImplTypes<vComplexD, 2>>;
+using RepsHMC  = Representations<FundamentalRep<2, GroupName::SU>>;
+using HMCWrapper = HMCWrapperTemplate<GimplHMC, MinimumNorm2, RepsHMC, XmlReader>;
 
 
-// template <class Gimpl>
+template <class Gimpl>
 class WilsonFundAdjointAction : public Action<typename Gimpl::GaugeField> {
 public:  
     INHERIT_GIMPL_TYPES(Gimpl);
@@ -563,19 +561,19 @@ private:
 //   delete grid;
 // }
 
-// bool getCmdOption(int argc, char** argv,
-//                   const std::string& option,
-//                   double& value)
-// {
-//     for(int i = 1; i < argc; ++i) {
-//         std::string arg(argv[i]);
-//         if(arg.find(option + "=") == 0) {
-//             value = std::stod(arg.substr(option.size() + 1));
-//             return true;
-//         }
-//     }
-//     return false;
-// }
+bool getCmdOption(int argc, char** argv,
+                  const std::string& option,
+                  double& value)
+{
+    for(int i = 1; i < argc; ++i) {
+        std::string arg(argv[i]);
+        if(arg.find(option + "=") == 0) {
+            value = std::stod(arg.substr(option.size() + 1));
+            return true;
+        }
+    }
+    return false;
+}
 
 
 int main(int argc, char **argv)
@@ -583,10 +581,8 @@ int main(int argc, char **argv)
     
     Grid_init(&argc, &argv);
     GridLogLayout();
-
-    // typedef PeriodicGaugeImpl<GaugeImplTypes<S, Dimension > > Gimpl;
-    // typedef PeriodicGimplR Gimpl;
-    // using Gimpl2 = PeriodicGaugeImpl<GaugeImplTypes<vComplexD, 2>>;
+    using Gimpl2 = PeriodicGaugeImpl<GaugeImplTypes<vComplexD, 2>>;
+    
     // WilsonFundAdjoint(beta, 0) == WilsonGaugeAction(1.0) test
     // Test_FundOnly_Equivalence_GridWilsonVsFundAdj<Gimpl2>(1.0, 10);
     
@@ -606,47 +602,48 @@ int main(int argc, char **argv)
     // SimpleSU2_ForceFD_Cayley<Gimpl2>(1.0, 1.0);
 
     std::cout << "Entering HMC\n";
+    
+    HMCWrapper TheHMC;
 
-    // HMCWrapper TheHMC;
-    // TheHMC.Resources.AddFourDimGrid("gauge");
+    TheHMC.Resources.AddFourDimGrid("gauge");
 
-    // CheckpointerParameters CPparams;
-    // CPparams.config_prefix = "ckpoint_lat";
-    // CPparams.rng_prefix    = "ckpoint_rng";
-    // CPparams.saveInterval  = 1;
-    // CPparams.format        = "IEEE64BIG";
-    // TheHMC.Resources.LoadNerscCheckpointer(CPparams);
+    CheckpointerParameters CPparams;
+    CPparams.config_prefix = "ckpoint_lat";
+    CPparams.rng_prefix    = "ckpoint_rng";
+    CPparams.saveInterval  = 1;
+    CPparams.format        = "IEEE64BIG";
+    TheHMC.Resources.LoadNerscCheckpointer(CPparams);
 
-    // RNGModuleParameters RNGpar;
-    // RNGpar.serial_seeds   = "1 2 3 4 5";
-    // RNGpar.parallel_seeds = "6 7 8 9 10";
-    // TheHMC.Resources.SetRNGSeeds(RNGpar);
+    RNGModuleParameters RNGpar;
+    RNGpar.serial_seeds   = "1 2 3 4 5";
+    RNGpar.parallel_seeds = "6 7 8 9 10";
+    TheHMC.Resources.SetRNGSeeds(RNGpar);
 
     // Observables
-    // typedef PlaquetteMod<HMCWrapper::ImplPolicy> PlaqObs;
-    // TheHMC.Resources.AddObservable<PlaqObs>();
+    typedef PlaquetteMod<HMCWrapper::ImplPolicy> PlaqObs;
+    TheHMC.Resources.AddObservable<PlaqObs>();
 
     // Action
-    // using Gimpl = typename HMCWrapper::ImplPolicy;
+    using Gimpl = typename HMCWrapper::ImplPolicy;
     using GaugeField = typename Gimpl::GaugeField;
 
-    // TheHMC.ReadCommandLine(argc, argv);
-    // std::cout << GridLogMessage << "About to run HMC with parsed parameters:\n";
+    TheHMC.ReadCommandLine(argc, argv);
+    std::cout << GridLogMessage << "About to run HMC with parsed parameters:\n";
     //std::cout << TheHMC.LogParameters();
     //std::cout << TheHMC.Parameters();
 
     // run parameters
     int n_mdSteps = 20;
     RealD trajL = 1.0;
-    // int n_therm = 50;
-    // int n_measurements = 10;
-    // int n_skip = 5;
-    // int n_traj = 10;
-
-    // TheHMC.Parameters.MD.MDsteps    = n_mdSteps;
-    // TheHMC.Parameters.MD.trajL      = trajL;
-    // TheHMC.Parameters.Trajectories  = n_traj;
-
+    int n_therm = 50;
+    int n_measurements = 10;
+    int n_skip = 5;
+    int n_traj = 10;
+    
+    TheHMC.Parameters.MD.MDsteps    = n_mdSteps;
+    TheHMC.Parameters.MD.trajL      = trajL;
+    TheHMC.Parameters.Trajectories  = n_traj;
+    
     RealD epsilon = trajL / RealD(n_mdSteps);
 
     // Single (betaF, betaA) point — values passed via --betaF=X --betaA=Y
@@ -654,22 +651,17 @@ int main(int argc, char **argv)
     // one independent job per grid point.
     RealD betaF = 1.2;
     RealD betaA = 1.2;
-    // getCmdOption(argc, argv, "--betaF", betaF);
-    // getCmdOption(argc, argv, "--betaA", betaA);
+    getCmdOption(argc, argv, "--betaF", betaF);
+    getCmdOption(argc, argv, "--betaA", betaA);
 
-    // TheHMC.TheAction.clear();
-    // auto *action = new WilsonFundAdjointAction<Gimpl>(betaF, betaA);
-    auto *action = new WilsonFundAdjointAction(betaF, betaA);
+    TheHMC.TheAction.clear();
 
-    // ActionLevel<HMCWrapper::Field> Level1(1);
-    // Level1.push_back(static_cast<Action<GaugeField>*>(Waction));
-    // TheHMC.TheAction.push_back(Level1);
+    auto *Waction = new WilsonFundAdjointAction<Gimpl>(betaF, betaA);
 
-    using Rep = Representations<FundamentalRepresentation>;
-    ActionLevel<GaugeField, Rep> Level1(1);
-    Level1.push_back(action);
-    ActionSet<GaugeField, Rep> TheAction;
-    TheAction.push_back(Level1);
+    ActionLevel<HMCWrapper::Field> Level1(1);
+    Level1.push_back(static_cast<Action<GaugeField>*>(Waction));
+    TheHMC.TheAction.push_back(Level1);
+
     std::cout << "\n============================================================\n"
               << "  HMC run\n"
               << "    betaF       = " << betaF << "\n"
@@ -677,55 +669,24 @@ int main(int argc, char **argv)
               << "    MDsteps     = " << n_mdSteps << "\n"
               << "    trajL       = " << trajL << "\n"
               << "    epsilon     = " << epsilon << "\n"
-              // << "    trajectories= " << n_traj << "\n"
+              << "    trajectories= " << n_traj << "\n"
               << "============================================================\n";
 
-    GridCartesian         * UGrid   = SpaceTimeGrid::makeFourDimGrid(GridDefaultLatt(),
-                                                                     GridDefaultSimd(Nd,vComplex::Nsimd()),
-                                                                     GridDefaultMpi());
-    GridSerialRNG sRNG;            sRNG.SeedFixedIntegers(std::vector<int>({45,12,81,9}));
-    std::vector<int> seeds4({1,2,3,4});
-    GridParallelRNG  RNG4(UGrid); RNG4.SeedFixedIntegers(seeds4);
+    // Cold start
+    TheHMC.Parameters.StartingType = std::string("ColdStart");
+    std::cout << "============================================================\n"
+              << "  HMC run with Cold Start\n"
+              << "============================================================\n";
+    TheHMC.Run();
 
-    GaugeField U(UGrid);
-    Gimpl::HotConfiguration(RNG4, U);
+    // Hot start
+    TheHMC.Parameters.StartingType = std::string("HotStart");
+    std::cout << "============================================================\n"
+              << "  HMC run with Hot Start\n"
+              << "============================================================\n";
+    TheHMC.Run();
 
-    IntegratorParameters MD;
-    MD.MDsteps = n_mdSteps;
-    MD.trajL   = trajL;
-    NoSmearing<Gimpl> Sm;
-    MinimumNorm2<Gimpl, NoSmearing<Gimpl>> integrator(UGrid, MD, TheAction, Sm);
-
-    std::vector<HmcObservable<GaugeField>*> none;
-
-    HMCparameters Params;
-    Params.NoMetropolisUntil = 0;
-    Params.Trajectories = 1;
-
-    //template <class IntegratorType>
-    HybridMonteCarlo HMC(Params, integrator,
-                           sRNG, RNG4,
-                           none, U);
-
-    HMC.evolve();
-
-    {
-      FieldMetaData header;
-      const std::string path = "ckpoint_lat." + std::to_string(1);
-      NerscIO::writeConfiguration(U, path);
-      // NerscIO::writeConfiguration(Umu,file,tworow,precision32);
-      auto Umu_saved = U;
-      NerscIO::readConfiguration(U, header, path);
-      auto Umu_diff = U - Umu_saved;
-      std::cout <<GridLogMessage<< "norm2 Gauge Diff = "<<norm2(Umu_diff)<<std::endl;
-      // emptyUserRecord record;
-      // ScidacWriter WR(UGrid->IsBoss());
-      // WR.open(path);
-      // WR.writeScidacFieldRecord(res, record);
-      // WR.close();
-    }
-
-
+    
     Grid_finalize();
     return 0;
 }

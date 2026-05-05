@@ -171,395 +171,395 @@ private:
     RealD betaA;
 };
 
-template<class Gimpl>
-void SimpleSU2_ForceFD_Cayley(Grid::RealD betaF, Grid::RealD betaA)
-{
-    using namespace Grid;
-    INHERIT_GIMPL_TYPES(Gimpl);
+// template<class Gimpl>
+// void SimpleSU2_ForceFD_Cayley(Grid::RealD betaF, Grid::RealD betaA)
+// {
+//     using namespace Grid;
+//     INHERIT_GIMPL_TYPES(Gimpl);
 
-    // 4^4 lattice
-    std::vector<int> L = {4,4,4,4};
-    Coordinate simd = GridDefaultSimd(Nd, vComplexD::Nsimd());
-    Coordinate mpi  = GridDefaultMpi();
-    GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(L, simd, mpi);
+//     // 4^4 lattice
+//     std::vector<int> L = {4,4,4,4};
+//     Coordinate simd = GridDefaultSimd(Nd, vComplexD::Nsimd());
+//     Coordinate mpi  = GridDefaultMpi();
+//     GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(L, simd, mpi);
 
-    GridParallelRNG pRNG(grid);
-    pRNG.SeedFixedIntegers({1,2,3,4});
+//     GridParallelRNG pRNG(grid);
+//     pRNG.SeedFixedIntegers({1,2,3,4});
 
-    // Random SU(2) configuration
-    GaugeField U(grid);
-    SU<2>::HotConfiguration(pRNG, U);
+//     // Random SU(2) configuration
+//     GaugeField U(grid);
+//     SU<2>::HotConfiguration(pRNG, U);
 
-    // Random su(2) direction H
-    GaugeField H(grid);
-    gaussian(pRNG, H);
-    for(int mu=0; mu<Nd; mu++){
-       GaugeLinkField Hmu = PeekIndex<LorentzIndex>(H, mu);
-       Hmu = Ta(Hmu);
-       PokeIndex<LorentzIndex>(H, Hmu, mu);
-    }
+//     // Random su(2) direction H
+//     GaugeField H(grid);
+//     gaussian(pRNG, H);
+//     for(int mu=0; mu<Nd; mu++){
+//        GaugeLinkField Hmu = PeekIndex<LorentzIndex>(H, mu);
+//        Hmu = Ta(Hmu);
+//        PokeIndex<LorentzIndex>(H, Hmu, mu);
+//     }
 
-    // Action and force at U
-    WilsonFundAdjointAction<Gimpl> action(betaF, betaA);
-    GaugeField F(grid);
-    action.deriv(U, F);
+//     // Action and force at U
+//     WilsonFundAdjointAction<Gimpl> action(betaF, betaA);
+//     GaugeField F(grid);
+//     action.deriv(U, F);
 
-    // Inner product: <H,F> = sum over links ReTr(H*F)
-    auto ReTrInner = [&](const GaugeField &A, const GaugeField &B)->RealD {
-        RealD acc = 0.0;
-        for(int mu=0; mu<Nd; mu++){
-            GaugeLinkField Amu = PeekIndex<LorentzIndex>(A, mu);
-            GaugeLinkField Bmu = PeekIndex<LorentzIndex>(B, mu);
-            ComplexField tr(grid);
-            tr = trace(Amu * Bmu);
-            acc += TensorRemove(sum(tr)).real();
-        }
-        return acc;
-    };
+//     // Inner product: <H,F> = sum over links ReTr(H*F)
+//     auto ReTrInner = [&](const GaugeField &A, const GaugeField &B)->RealD {
+//         RealD acc = 0.0;
+//         for(int mu=0; mu<Nd; mu++){
+//             GaugeLinkField Amu = PeekIndex<LorentzIndex>(A, mu);
+//             GaugeLinkField Bmu = PeekIndex<LorentzIndex>(B, mu);
+//             ComplexField tr(grid);
+//             tr = trace(Amu * Bmu);
+//             acc += TensorRemove(sum(tr)).real();
+//         }
+//         return acc;
+//     };
 
-    // SU(2)-valued left update via Cayley transform
-    // U -> (I + (eps/2) H) (I - (eps/2) H)^{-1} U
-    // For H in su(2): H^2 = -h2 * I, with h2 = -1/2 ReTr(H*H).
-    auto LeftUpdate_Cayley = [&](const GaugeField &Uin, const GaugeField &Hin, RealD eps)->GaugeField {
-        GaugeField Uout(grid);
+//     // SU(2)-valued left update via Cayley transform
+//     // U -> (I + (eps/2) H) (I - (eps/2) H)^{-1} U
+//     // For H in su(2): H^2 = -h2 * I, with h2 = -1/2 ReTr(H*H).
+//     auto LeftUpdate_Cayley = [&](const GaugeField &Uin, const GaugeField &Hin, RealD eps)->GaugeField {
+//         GaugeField Uout(grid);
     
-        RealD a = eps * RealD(0.5); // Cayley parameter
+//         RealD a = eps * RealD(0.5); // Cayley parameter
     
-        for(int mu=0; mu<Nd; mu++){
-            GaugeLinkField Umu = PeekIndex<LorentzIndex>(Uin, mu);
-            GaugeLinkField Hmu = PeekIndex<LorentzIndex>(Hin, mu);
+//         for(int mu=0; mu<Nd; mu++){
+//             GaugeLinkField Umu = PeekIndex<LorentzIndex>(Uin, mu);
+//             GaugeLinkField Hmu = PeekIndex<LorentzIndex>(Hin, mu);
     
-            GaugeLinkField I(grid); I = 1.0;
+//             GaugeLinkField I(grid); I = 1.0;
     
-            // trHH = Tr(HH) (ComplexField, but should be real for su(2))
-            ComplexField trHH(grid);
-            trHH = trace(Hmu * Hmu);
+//             // trHH = Tr(HH) (ComplexField, but should be real for su(2))
+//             ComplexField trHH(grid);
+//             trHH = trace(Hmu * Hmu);
             
-            // trHH_re as ComplexField (purely real)
-            ComplexField trHH_re(grid);
-            trHH_re = ComplexD(1.0, 0.0) * real(trHH);
+//             // trHH_re as ComplexField (purely real)
+//             ComplexField trHH_re(grid);
+//             trHH_re = ComplexD(1.0, 0.0) * real(trHH);
             
-            // h2 = -1/2 ReTr(HH) as ComplexField (purely real)
-            ComplexField h2(grid);
-            h2 = ComplexD(-0.5, 0.0) * trHH_re;
+//             // h2 = -1/2 ReTr(HH) as ComplexField (purely real)
+//             ComplexField h2(grid);
+//             h2 = ComplexD(-0.5, 0.0) * trHH_re;
             
-            // denom = 1 + a^2 h2
-            ComplexField one(grid);
-            one = ComplexD(1.0, 0.0);
+//             // denom = 1 + a^2 h2
+//             ComplexField one(grid);
+//             one = ComplexD(1.0, 0.0);
             
-            ComplexField denom(grid);
-            denom = one + ComplexD(a*a, 0.0) * h2;
+//             ComplexField denom(grid);
+//             denom = one + ComplexD(a*a, 0.0) * h2;
             
-            // invdenom = 1/denom   (lattice/lattice)
-            ComplexField invdenom(grid);
-            invdenom = one / denom;
+//             // invdenom = 1/denom   (lattice/lattice)
+//             ComplexField invdenom(grid);
+//             invdenom = one / denom;
             
-            // c0, c1 as ComplexField (lattice/lattice only)
-            ComplexField c0(grid), c1(grid);
+//             // c0, c1 as ComplexField (lattice/lattice only)
+//             ComplexField c0(grid), c1(grid);
             
-            ComplexField twoa(grid);
-            twoa = ComplexD(2.0*a, 0.0);
+//             ComplexField twoa(grid);
+//             twoa = ComplexD(2.0*a, 0.0);
             
-            c0 = (one - ComplexD(a*a, 0.0) * h2) * invdenom;
-            c1 = twoa * invdenom;
+//             c0 = (one - ComplexD(a*a, 0.0) * h2) * invdenom;
+//             c1 = twoa * invdenom;
             
-            // X = c0 I + c1 H
-            GaugeLinkField X(grid);
-            X = c0 * I + c1 * Hmu;
+//             // X = c0 I + c1 H
+//             GaugeLinkField X(grid);
+//             X = c0 * I + c1 * Hmu;
 
     
-            GaugeLinkField Up(grid);
-            Up = X * Umu;
+//             GaugeLinkField Up(grid);
+//             Up = X * Umu;
     
-            PokeIndex<LorentzIndex>(Uout, Up, mu);
-        }
-        return Uout;
-    };
-
-
-
-
-    // eps (of course, the test should fail at large eps)
-    RealD eps_min=1e-4, eps_max=1.0; int N=20;
-    std::vector<RealD> eps_list;
-    for(int i=0;i<=N;i++) eps_list.push_back(eps_min*std::pow(eps_max/eps_min, RealD(i)/N));
-
-
-    std::cout << "## SU2_FORCE_FD_Cayley betaF=" << betaF
-              << " betaA=" << betaA
-              << " Nc=" << Nc << " Nd=" << Nd << "\n";
-    std::cout << "## columns: eps deltaS_fd  minus_ReTr(HF)  ratio  relerr\n";
-
-    // Force-predicted directional variation at U (sign convention: minus)
-    RealD deltaS_force = -ReTrInner(H, F);
-
-    for(auto eps : eps_list){
-        GaugeField Uplus  = LeftUpdate_Cayley(U, H, +eps);
-        GaugeField Uminus = LeftUpdate_Cayley(U, H, -eps);
-
-
-        RealD Splus  = action.S(Uplus);
-        RealD Sminus = action.S(Uminus);
-
-        RealD deltaS_fd = (Splus - Sminus) / (RealD(2.0) * eps);
-
-        RealD ratio  = deltaS_force / deltaS_fd;
-        RealD relerr = fabs((deltaS_force - deltaS_fd) / deltaS_fd);
+//             PokeIndex<LorentzIndex>(Uout, Up, mu);
+//         }
+//         return Uout;
+//     };
+
+
+
+
+//     // eps (of course, the test should fail at large eps)
+//     RealD eps_min=1e-4, eps_max=1.0; int N=20;
+//     std::vector<RealD> eps_list;
+//     for(int i=0;i<=N;i++) eps_list.push_back(eps_min*std::pow(eps_max/eps_min, RealD(i)/N));
+
+
+//     std::cout << "## SU2_FORCE_FD_Cayley betaF=" << betaF
+//               << " betaA=" << betaA
+//               << " Nc=" << Nc << " Nd=" << Nd << "\n";
+//     std::cout << "## columns: eps deltaS_fd  minus_ReTr(HF)  ratio  relerr\n";
+
+//     // Force-predicted directional variation at U (sign convention: minus)
+//     RealD deltaS_force = -ReTrInner(H, F);
+
+//     for(auto eps : eps_list){
+//         GaugeField Uplus  = LeftUpdate_Cayley(U, H, +eps);
+//         GaugeField Uminus = LeftUpdate_Cayley(U, H, -eps);
+
+
+//         RealD Splus  = action.S(Uplus);
+//         RealD Sminus = action.S(Uminus);
+
+//         RealD deltaS_fd = (Splus - Sminus) / (RealD(2.0) * eps);
+
+//         RealD ratio  = deltaS_force / deltaS_fd;
+//         RealD relerr = fabs((deltaS_force - deltaS_fd) / deltaS_fd);
 
-        std::cout << std::setprecision(16)
-                  << eps << " "
-                  << deltaS_fd << " "
-                  << deltaS_force << " "
-                  << ratio << " "
-                  << relerr << "\n";
-    }
-
-    delete grid;
-}
-
-template<class Gimpl>
-void SimpleSU2_ForceFD_FirstOrder(Grid::RealD betaF, Grid::RealD betaA)
-{
-    using namespace Grid;
-    INHERIT_GIMPL_TYPES(Gimpl);
+//         std::cout << std::setprecision(16)
+//                   << eps << " "
+//                   << deltaS_fd << " "
+//                   << deltaS_force << " "
+//                   << ratio << " "
+//                   << relerr << "\n";
+//     }
+
+//     delete grid;
+// }
+
+// template<class Gimpl>
+// void SimpleSU2_ForceFD_FirstOrder(Grid::RealD betaF, Grid::RealD betaA)
+// {
+//     using namespace Grid;
+//     INHERIT_GIMPL_TYPES(Gimpl);
 
-    // 4^4 lattice
-    std::vector<int> L = {4,4,4,4};
-    Coordinate simd = GridDefaultSimd(Nd, vComplexD::Nsimd());
-    Coordinate mpi  = GridDefaultMpi();
-    GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(L, simd, mpi);
-
-    GridParallelRNG pRNG(grid);
-    pRNG.SeedFixedIntegers({1,2,3,4});
+//     // 4^4 lattice
+//     std::vector<int> L = {4,4,4,4};
+//     Coordinate simd = GridDefaultSimd(Nd, vComplexD::Nsimd());
+//     Coordinate mpi  = GridDefaultMpi();
+//     GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(L, simd, mpi);
+
+//     GridParallelRNG pRNG(grid);
+//     pRNG.SeedFixedIntegers({1,2,3,4});
 
-    // Random SU(2) configuration
-    GaugeField U(grid);
-    SU<2>::HotConfiguration(pRNG, U);
+//     // Random SU(2) configuration
+//     GaugeField U(grid);
+//     SU<2>::HotConfiguration(pRNG, U);
 
-    // Random su(2) direction H
-    GaugeField H(grid);
-    gaussian(pRNG, H);
-    for(int mu=0; mu<Nd; mu++){
-       GaugeLinkField Hmu = PeekIndex<LorentzIndex>(H, mu);
-       Hmu = Ta(Hmu);
-       PokeIndex<LorentzIndex>(H, Hmu, mu);
-    }
+//     // Random su(2) direction H
+//     GaugeField H(grid);
+//     gaussian(pRNG, H);
+//     for(int mu=0; mu<Nd; mu++){
+//        GaugeLinkField Hmu = PeekIndex<LorentzIndex>(H, mu);
+//        Hmu = Ta(Hmu);
+//        PokeIndex<LorentzIndex>(H, Hmu, mu);
+//     }
 
-    // Action and force at U
-    WilsonFundAdjointAction<Gimpl> action(betaF, betaA);
-    GaugeField F(grid);
-    action.deriv(U, F);
+//     // Action and force at U
+//     WilsonFundAdjointAction<Gimpl> action(betaF, betaA);
+//     GaugeField F(grid);
+//     action.deriv(U, F);
 
-    // Inner product: <H,F> = sum over links ReTr(H*F)
-    auto ReTrInner = [&](const GaugeField &A, const GaugeField &B)->RealD {
-        RealD acc = 0.0;
-        for(int mu=0; mu<Nd; mu++){
-            GaugeLinkField Amu = PeekIndex<LorentzIndex>(A, mu);
-            GaugeLinkField Bmu = PeekIndex<LorentzIndex>(B, mu);
-            ComplexField tr(grid);
-            tr = trace(Amu * Bmu);
-            acc += TensorRemove(sum(tr)).real();
-        }
-        return acc;
-    };
-
-    // First-order "group" displacement: U -> (I + eps H) U
-    auto LeftUpdate_FirstOrder = [&](const GaugeField &Uin, const GaugeField &Hin, RealD eps)->GaugeField {
-        GaugeField Uout(grid);
-
-        for(int mu=0; mu<Nd; mu++){
-            GaugeLinkField Umu = PeekIndex<LorentzIndex>(Uin, mu);
-            GaugeLinkField Hmu = PeekIndex<LorentzIndex>(Hin, mu);
-
-            GaugeLinkField I(grid);
-            I = 1.0;
-
-            GaugeLinkField Up(grid);
-            Up = (I + eps * Hmu) * Umu;
-
-            PokeIndex<LorentzIndex>(Uout, Up, mu);
-        }
-        return Uout;
-    };
-
-    // eps (of course, the test should fail at large eps)
-    RealD eps_min=1e-4, eps_max=1.0; int N=20;
-    std::vector<RealD> eps_list;
-    for(int i=0;i<=N;i++) eps_list.push_back(eps_min*std::pow(eps_max/eps_min, RealD(i)/N));
-
-
-    std::cout << "## SU2_FORCE_FD_FIRST_ORDER betaF=" << betaF
-              << " betaA=" << betaA
-              << " Nc=" << Nc << " Nd=" << Nd << "\n";
-    std::cout << "## columns: eps deltaS_fd  minus_ReTr(HF)  ratio  relerr\n";
-
-    // Force-predicted directional variation at U (sign convention: minus)
-    RealD deltaS_force = -ReTrInner(H, F);
-
-    for(auto eps : eps_list){
-        GaugeField Uplus  = LeftUpdate_FirstOrder(U, H, +eps);
-        GaugeField Uminus = LeftUpdate_FirstOrder(U, H, -eps);
-
-        RealD Splus  = action.S(Uplus);
-        RealD Sminus = action.S(Uminus);
-
-        RealD deltaS_fd = (Splus - Sminus) / (RealD(2.0) * eps);
-
-        RealD ratio  = deltaS_force / deltaS_fd;
-        RealD relerr = fabs((deltaS_force - deltaS_fd) / deltaS_fd);
-
-        std::cout << std::setprecision(16)
-                  << eps << " "
-                  << deltaS_fd << " "
-                  << deltaS_force << " "
-                  << ratio << " "
-                  << relerr << "\n";
-    }
-
-    delete grid;
-}
-
-
-template<class Gimpl>
-void SimpleSU2_GaugeInvarianceCheck(Grid::RealD betaF, Grid::RealD betaA)
-{
-    using namespace Grid;
-    INHERIT_GIMPL_TYPES(Gimpl);
-    //static_assert(Nc == 2, "This test must be instantiated with an SU(2) Gimpl (Nc=2).");
-
-    std::cout << "Nc (in HMCWrapper) = " << Nc << std::endl;
-
-
-    // 4^4 lattice
-    std::vector<int> L = {4,4,4,4};
-    Coordinate simd = GridDefaultSimd(Nd, vComplexD::Nsimd());
-    Coordinate mpi  = GridDefaultMpi();
-    GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(L, simd, mpi);
-
-    GridParallelRNG pRNG(grid);
-    pRNG.SeedFixedIntegers({1,2,3,4});
-
-    // Random configuration U (use the ImplementationPolicy, not SU<...>)
-    GaugeField U(grid);
-    SU<2>::HotConfiguration(pRNG, U);
-
-    // Action
-    WilsonFundAdjointAction<Gimpl> action(betaF, betaA);
-
-    // Random local gauge transform G(x):
-    // build a temporary GaugeField so HotConfiguration can fill it,
-    // then steal one Lorentz component as a site field.
-    GaugeField Gtmp(grid);
-    SU<2>::HotConfiguration(pRNG, Gtmp);
-
-    GaugeLinkField G(grid);
-    G = PeekIndex<LorentzIndex>(Gtmp, 0);
-
-    // Gauge-transformed field Ug: U'_mu(x) = G(x) U_mu(x) G^\dagger(x+mu)
-    GaugeField Ug(grid);
-    for(int mu = 0; mu < Nd; mu++){
-        GaugeLinkField Umu = PeekIndex<LorentzIndex>(U,  mu);
-        GaugeLinkField Gf  = Cshift(G, mu, +1);
-        GaugeLinkField Up  = G * Umu * adj(Gf);
-        PokeIndex<LorentzIndex>(Ug, Up, mu);
-    }
-
-    RealD S0 = action.S(U);
-    RealD Sg = action.S(Ug);
-    RealD dS = Sg - S0;
-
-    std::cout << "## GAUGE_INVARIANCE_CHECK betaF=" << betaF
-              << " betaA=" << betaA
-              << " Nc=" << Nc << " Nd=" << Nd << "\n";
-    std::cout << std::setprecision(16)
-              << "S(U)   = " << S0 << "\n"
-              << "S(U^G) = " << Sg << "\n"
-              << "dS     = " << dS << "\n";
-
-    delete grid;
-}
-
-template <class Gimpl>
-void Test_FundOnly_Equivalence_GridWilsonVsFundAdj(Grid::RealD beta, int ncfg = 10)
-{
-  using namespace Grid;
-  INHERIT_GIMPL_TYPES(Gimpl);
-
-  // 4^4 lattice
-  std::vector<int> L = {4,4,4,4};
-  Coordinate simd = GridDefaultSimd(Nd, vComplexD::Nsimd());
-  Coordinate mpi  = GridDefaultMpi();
-  GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(L, simd, mpi);
-
-  GridParallelRNG pRNG(grid);
-  pRNG.SeedFixedIntegers({101,202,303,404});
-
-  // IMPORTANT: fully qualify to force Grid's class (avoid ambiguity)
-  Grid::WilsonGaugeAction<Gimpl>       A(beta);
-  WilsonFundAdjointAction<Gimpl>       B(beta, 0.0);
-
-  // ReTr inner product on link fields: sum_mu ReTr(X_mu * Y_mu)
-  auto ReTrInner = [&](const typename Gimpl::GaugeField &X,
-                       const typename Gimpl::GaugeField &Y)->RealD {
-    RealD acc = 0.0;
-    for(int mu=0; mu<Nd; mu++){
-      GaugeLinkField Xmu = PeekIndex<LorentzIndex>(X, mu);
-      GaugeLinkField Ymu = PeekIndex<LorentzIndex>(Y, mu);
-      ComplexField tr(grid);
-      tr = trace(Xmu * Ymu);
-      acc += TensorRemove(sum(tr)).real();
-    }
-    return acc;
-  };
-
-  std::cout << "## FUND_ONLY_EQUIV (Grid::WilsonGaugeAction vs WilsonFundAdjoint betaA=0)\n";
-  std::cout << "## beta=" << beta << " Nc=" << Nc << " Nd=" << Nd << " ncfg=" << ncfg << "\n";
-  std::cout << "## columns: cfg  SA  SB  dS  |dS|  dirA  dirB  ratio(dirA/dirB)  rel(|dirA-dirB|)\n";
-
-  for(int cfg=0; cfg<ncfg; cfg++){
-    typename Gimpl::GaugeField U(grid);
-    SU<Nc>::HotConfiguration(pRNG, U);
-
-    // 1) Action values
-    RealD SA = A.S(U);
-    RealD SB = B.S(U);
-    RealD dS = SA - SB;
-
-    // 2) Force comparison in a random direction H
-    typename Gimpl::GaugeField H(grid);
-    gaussian(pRNG, H);
-    for(int mu=0; mu<Nd; mu++){
-      GaugeLinkField Hmu = PeekIndex<LorentzIndex>(H, mu);
-      Hmu = Ta(Hmu);
-      PokeIndex<LorentzIndex>(H, Hmu, mu);
-    }
-
-    typename Gimpl::GaugeField FA(grid), FB(grid);
-    A.deriv(U, FA);
-    B.deriv(U, FB);
-
-    RealD dirA = -ReTrInner(H, FA);
-    RealD dirB = -ReTrInner(H, FB);
-
-    RealD ratio = dirA / dirB;
-
-    RealD scale = std::max(RealD(1.0), std::max(fabs(dirA), fabs(dirB)));
-    RealD rel   = fabs(dirA - dirB) / scale;
-
-    std::cout << std::setprecision(16)
-              << cfg << " "
-              << SA << " "
-              << SB << " "
-              << dS << " "
-              << fabs(dS) << " "
-              << dirA << " "
-              << dirB << " "
-              << ratio << " "
-              << rel << "\n";
-  }
-
-  delete grid;
-}
+//     // Inner product: <H,F> = sum over links ReTr(H*F)
+//     auto ReTrInner = [&](const GaugeField &A, const GaugeField &B)->RealD {
+//         RealD acc = 0.0;
+//         for(int mu=0; mu<Nd; mu++){
+//             GaugeLinkField Amu = PeekIndex<LorentzIndex>(A, mu);
+//             GaugeLinkField Bmu = PeekIndex<LorentzIndex>(B, mu);
+//             ComplexField tr(grid);
+//             tr = trace(Amu * Bmu);
+//             acc += TensorRemove(sum(tr)).real();
+//         }
+//         return acc;
+//     };
+
+//     // First-order "group" displacement: U -> (I + eps H) U
+//     auto LeftUpdate_FirstOrder = [&](const GaugeField &Uin, const GaugeField &Hin, RealD eps)->GaugeField {
+//         GaugeField Uout(grid);
+
+//         for(int mu=0; mu<Nd; mu++){
+//             GaugeLinkField Umu = PeekIndex<LorentzIndex>(Uin, mu);
+//             GaugeLinkField Hmu = PeekIndex<LorentzIndex>(Hin, mu);
+
+//             GaugeLinkField I(grid);
+//             I = 1.0;
+
+//             GaugeLinkField Up(grid);
+//             Up = (I + eps * Hmu) * Umu;
+
+//             PokeIndex<LorentzIndex>(Uout, Up, mu);
+//         }
+//         return Uout;
+//     };
+
+//     // eps (of course, the test should fail at large eps)
+//     RealD eps_min=1e-4, eps_max=1.0; int N=20;
+//     std::vector<RealD> eps_list;
+//     for(int i=0;i<=N;i++) eps_list.push_back(eps_min*std::pow(eps_max/eps_min, RealD(i)/N));
+
+
+//     std::cout << "## SU2_FORCE_FD_FIRST_ORDER betaF=" << betaF
+//               << " betaA=" << betaA
+//               << " Nc=" << Nc << " Nd=" << Nd << "\n";
+//     std::cout << "## columns: eps deltaS_fd  minus_ReTr(HF)  ratio  relerr\n";
+
+//     // Force-predicted directional variation at U (sign convention: minus)
+//     RealD deltaS_force = -ReTrInner(H, F);
+
+//     for(auto eps : eps_list){
+//         GaugeField Uplus  = LeftUpdate_FirstOrder(U, H, +eps);
+//         GaugeField Uminus = LeftUpdate_FirstOrder(U, H, -eps);
+
+//         RealD Splus  = action.S(Uplus);
+//         RealD Sminus = action.S(Uminus);
+
+//         RealD deltaS_fd = (Splus - Sminus) / (RealD(2.0) * eps);
+
+//         RealD ratio  = deltaS_force / deltaS_fd;
+//         RealD relerr = fabs((deltaS_force - deltaS_fd) / deltaS_fd);
+
+//         std::cout << std::setprecision(16)
+//                   << eps << " "
+//                   << deltaS_fd << " "
+//                   << deltaS_force << " "
+//                   << ratio << " "
+//                   << relerr << "\n";
+//     }
+
+//     delete grid;
+// }
+
+
+// template<class Gimpl>
+// void SimpleSU2_GaugeInvarianceCheck(Grid::RealD betaF, Grid::RealD betaA)
+// {
+//     using namespace Grid;
+//     INHERIT_GIMPL_TYPES(Gimpl);
+//     //static_assert(Nc == 2, "This test must be instantiated with an SU(2) Gimpl (Nc=2).");
+
+//     std::cout << "Nc (in HMCWrapper) = " << Nc << std::endl;
+
+
+//     // 4^4 lattice
+//     std::vector<int> L = {4,4,4,4};
+//     Coordinate simd = GridDefaultSimd(Nd, vComplexD::Nsimd());
+//     Coordinate mpi  = GridDefaultMpi();
+//     GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(L, simd, mpi);
+
+//     GridParallelRNG pRNG(grid);
+//     pRNG.SeedFixedIntegers({1,2,3,4});
+
+//     // Random configuration U (use the ImplementationPolicy, not SU<...>)
+//     GaugeField U(grid);
+//     SU<2>::HotConfiguration(pRNG, U);
+
+//     // Action
+//     WilsonFundAdjointAction<Gimpl> action(betaF, betaA);
+
+//     // Random local gauge transform G(x):
+//     // build a temporary GaugeField so HotConfiguration can fill it,
+//     // then steal one Lorentz component as a site field.
+//     GaugeField Gtmp(grid);
+//     SU<2>::HotConfiguration(pRNG, Gtmp);
+
+//     GaugeLinkField G(grid);
+//     G = PeekIndex<LorentzIndex>(Gtmp, 0);
+
+//     // Gauge-transformed field Ug: U'_mu(x) = G(x) U_mu(x) G^\dagger(x+mu)
+//     GaugeField Ug(grid);
+//     for(int mu = 0; mu < Nd; mu++){
+//         GaugeLinkField Umu = PeekIndex<LorentzIndex>(U,  mu);
+//         GaugeLinkField Gf  = Cshift(G, mu, +1);
+//         GaugeLinkField Up  = G * Umu * adj(Gf);
+//         PokeIndex<LorentzIndex>(Ug, Up, mu);
+//     }
+
+//     RealD S0 = action.S(U);
+//     RealD Sg = action.S(Ug);
+//     RealD dS = Sg - S0;
+
+//     std::cout << "## GAUGE_INVARIANCE_CHECK betaF=" << betaF
+//               << " betaA=" << betaA
+//               << " Nc=" << Nc << " Nd=" << Nd << "\n";
+//     std::cout << std::setprecision(16)
+//               << "S(U)   = " << S0 << "\n"
+//               << "S(U^G) = " << Sg << "\n"
+//               << "dS     = " << dS << "\n";
+
+//     delete grid;
+// }
+
+// template <class Gimpl>
+// void Test_FundOnly_Equivalence_GridWilsonVsFundAdj(Grid::RealD beta, int ncfg = 10)
+// {
+//   using namespace Grid;
+//   INHERIT_GIMPL_TYPES(Gimpl);
+
+//   // 4^4 lattice
+//   std::vector<int> L = {4,4,4,4};
+//   Coordinate simd = GridDefaultSimd(Nd, vComplexD::Nsimd());
+//   Coordinate mpi  = GridDefaultMpi();
+//   GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(L, simd, mpi);
+
+//   GridParallelRNG pRNG(grid);
+//   pRNG.SeedFixedIntegers({101,202,303,404});
+
+//   // IMPORTANT: fully qualify to force Grid's class (avoid ambiguity)
+//   Grid::WilsonGaugeAction<Gimpl>       A(beta);
+//   WilsonFundAdjointAction<Gimpl>       B(beta, 0.0);
+
+//   // ReTr inner product on link fields: sum_mu ReTr(X_mu * Y_mu)
+//   auto ReTrInner = [&](const typename Gimpl::GaugeField &X,
+//                        const typename Gimpl::GaugeField &Y)->RealD {
+//     RealD acc = 0.0;
+//     for(int mu=0; mu<Nd; mu++){
+//       GaugeLinkField Xmu = PeekIndex<LorentzIndex>(X, mu);
+//       GaugeLinkField Ymu = PeekIndex<LorentzIndex>(Y, mu);
+//       ComplexField tr(grid);
+//       tr = trace(Xmu * Ymu);
+//       acc += TensorRemove(sum(tr)).real();
+//     }
+//     return acc;
+//   };
+
+//   std::cout << "## FUND_ONLY_EQUIV (Grid::WilsonGaugeAction vs WilsonFundAdjoint betaA=0)\n";
+//   std::cout << "## beta=" << beta << " Nc=" << Nc << " Nd=" << Nd << " ncfg=" << ncfg << "\n";
+//   std::cout << "## columns: cfg  SA  SB  dS  |dS|  dirA  dirB  ratio(dirA/dirB)  rel(|dirA-dirB|)\n";
+
+//   for(int cfg=0; cfg<ncfg; cfg++){
+//     typename Gimpl::GaugeField U(grid);
+//     SU<Nc>::HotConfiguration(pRNG, U);
+
+//     // 1) Action values
+//     RealD SA = A.S(U);
+//     RealD SB = B.S(U);
+//     RealD dS = SA - SB;
+
+//     // 2) Force comparison in a random direction H
+//     typename Gimpl::GaugeField H(grid);
+//     gaussian(pRNG, H);
+//     for(int mu=0; mu<Nd; mu++){
+//       GaugeLinkField Hmu = PeekIndex<LorentzIndex>(H, mu);
+//       Hmu = Ta(Hmu);
+//       PokeIndex<LorentzIndex>(H, Hmu, mu);
+//     }
+
+//     typename Gimpl::GaugeField FA(grid), FB(grid);
+//     A.deriv(U, FA);
+//     B.deriv(U, FB);
+
+//     RealD dirA = -ReTrInner(H, FA);
+//     RealD dirB = -ReTrInner(H, FB);
+
+//     RealD ratio = dirA / dirB;
+
+//     RealD scale = std::max(RealD(1.0), std::max(fabs(dirA), fabs(dirB)));
+//     RealD rel   = fabs(dirA - dirB) / scale;
+
+//     std::cout << std::setprecision(16)
+//               << cfg << " "
+//               << SA << " "
+//               << SB << " "
+//               << dS << " "
+//               << fabs(dS) << " "
+//               << dirA << " "
+//               << dirB << " "
+//               << ratio << " "
+//               << rel << "\n";
+//   }
+
+//   delete grid;
+// }
 
 bool getCmdOption(int argc, char** argv,
                   const std::string& option,
@@ -586,20 +586,20 @@ int main(int argc, char **argv)
     // WilsonFundAdjoint(beta, 0) == WilsonGaugeAction(1.0) test
     Test_FundOnly_Equivalence_GridWilsonVsFundAdj<Gimpl2>(1.0, 10);
     
-    // Gauge Invariance Test
-    SimpleSU2_GaugeInvarianceCheck<Gimpl2>(1.0, 0.0);
-    SimpleSU2_GaugeInvarianceCheck<Gimpl2>(0.0, 1.0);
-    SimpleSU2_GaugeInvarianceCheck<Gimpl2>(1.0, 1.0);
+    // // Gauge Invariance Test
+    // SimpleSU2_GaugeInvarianceCheck<Gimpl2>(1.0, 0.0);
+    // SimpleSU2_GaugeInvarianceCheck<Gimpl2>(0.0, 1.0);
+    // SimpleSU2_GaugeInvarianceCheck<Gimpl2>(1.0, 1.0);
 
-    // Force vs Finite Difference test (First order)
-    SimpleSU2_ForceFD_FirstOrder<Gimpl2>(1.0, 0.0);
-    SimpleSU2_ForceFD_FirstOrder<Gimpl2>(0.0, 1.0);
-    SimpleSU2_ForceFD_FirstOrder<Gimpl2>(1.0, 1.0);
+    // // Force vs Finite Difference test (First order)
+    // SimpleSU2_ForceFD_FirstOrder<Gimpl2>(1.0, 0.0);
+    // SimpleSU2_ForceFD_FirstOrder<Gimpl2>(0.0, 1.0);
+    // SimpleSU2_ForceFD_FirstOrder<Gimpl2>(1.0, 1.0);
 
-    // Force vs Finite Difference test (Cayley)
-    SimpleSU2_ForceFD_Cayley<Gimpl2>(1.0, 0.0);
-    SimpleSU2_ForceFD_Cayley<Gimpl2>(0.0, 1.0);
-    SimpleSU2_ForceFD_Cayley<Gimpl2>(1.0, 1.0);
+    // // Force vs Finite Difference test (Cayley)
+    // SimpleSU2_ForceFD_Cayley<Gimpl2>(1.0, 0.0);
+    // SimpleSU2_ForceFD_Cayley<Gimpl2>(0.0, 1.0);
+    // SimpleSU2_ForceFD_Cayley<Gimpl2>(1.0, 1.0);
 
     std::cout << "Entering HMC\n";
     

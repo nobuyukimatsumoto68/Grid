@@ -150,7 +150,8 @@ HmcState* grid_hmc_init(int NP_T, int NP_X, int NP_Y, int NP_Z,
     S->pRNG->SeedFixedIntegers({1, 2, 3, 4});
 
     S->U = std::make_unique<GaugeField>(S->UGrid.get());
-    Gimpl::ColdConfiguration(*(S->pRNG), *(S->U));
+    // Gimpl::ColdConfiguration(*(S->pRNG), *(S->U));
+    Gimpl::HotConfiguration(*(S->pRNG), *(S->U));
 
     S->action = std::make_unique<WilsonFundAdjointAction>(betaF, betaA);
 
