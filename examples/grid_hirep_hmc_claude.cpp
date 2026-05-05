@@ -114,27 +114,31 @@ extern "C"
 HmcState* grid_hmc_init(int NP_T, int NP_X, int NP_Y, int NP_Z,
                         int Nt, int Nx, int Ny, int Nz,
                         double betaF, double betaA,
-                        int n_mdSteps, double trajL)
+                        int n_mdSteps, double trajL, int n_omp)
 {
     HmcState* S = new HmcState();
-    // Build fake argv: --grid Nx.Ny.Nz.Nt  --mpi NP_X.NP_Y.NP_Z.NP_T
+    // Build fake argv: --grid Nx.Ny.Nz.Nt  --mpi NP_X.NP_Y.NP_Z.NP_T  --threads n_omp
     // Grid dimension order is x,y,z,t = 0,1,2,3
-    std::string prog      = "hirep_hmc";
-    std::string grid_flag = "--grid";
-    std::string grid_val  = std::to_string(Nx) + "." + std::to_string(Ny) + "."
-                          + std::to_string(Nz) + "." + std::to_string(Nt);
-    std::string mpi_flag  = "--mpi";
-    std::string mpi_val   = std::to_string(NP_X) + "." + std::to_string(NP_Y) + "."
-                          + std::to_string(NP_Z) + "." + std::to_string(NP_T);
+    std::string prog         = "hirep_hmc";
+    std::string grid_flag    = "--grid";
+    std::string grid_val     = std::to_string(Nx) + "." + std::to_string(Ny) + "."
+                             + std::to_string(Nz) + "." + std::to_string(Nt);
+    std::string mpi_flag     = "--mpi";
+    std::string mpi_val      = std::to_string(NP_X) + "." + std::to_string(NP_Y) + "."
+                             + std::to_string(NP_Z) + "." + std::to_string(NP_T);
+    std::string thread_flag  = "--threads";
+    std::string thread_val   = std::to_string(n_omp);
     std::vector<char*> fake_argv = {
         const_cast<char*>(prog.c_str()),
         const_cast<char*>(grid_flag.c_str()),
         const_cast<char*>(grid_val.c_str()),
         const_cast<char*>(mpi_flag.c_str()),
         const_cast<char*>(mpi_val.c_str()),
+        const_cast<char*>(thread_flag.c_str()),
+        const_cast<char*>(thread_val.c_str()),
         nullptr
     };
-    int    fake_argc     = 5;
+    int    fake_argc     = 7;
     char** fake_argv_ptr = fake_argv.data();
     Grid_init(&fake_argc, &fake_argv_ptr);
     GridLogLayout();
