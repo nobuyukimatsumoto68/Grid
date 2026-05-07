@@ -326,8 +326,8 @@ int main (int argc, char ** argv)
       // }
       // break;
     } // for dilute
-    std::cout << "# @@ res = " << std::endl
-              << res << std::endl;
+    // std::cout << "# @@ res = " << std::endl
+    //           << res << std::endl;
 
     {
       const std::string path = obsdir + "/disc_lat." + std::to_string(conf);
