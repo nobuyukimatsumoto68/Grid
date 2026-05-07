@@ -12,7 +12,7 @@ void ParseArgs(int argc, char** argv,
                std::string& dir,
                std::string& obsdir)
 {
-  const char* const short_opts = "+:m:b:d:o:";
+  const char* const short_opts = ":m:b:d:o:";
   const option long_opts[] = {
     {"mass",   required_argument, nullptr, 'm'},
     {"beta",   required_argument, nullptr, 'b'},
@@ -116,12 +116,6 @@ void TraceField(LatticeComplex& meson_CF,
 
 int main (int argc, char ** argv)
 {
-  double mass   = 0.4;
-  double beta   = 11.08;
-  std::string dir    = "/mnt/baracuda_14/grid_claude/16c";
-  std::string obsdir = "/mnt/baracuda_14/grid_claude/16c_obs";
-  ParseArgs(argc, argv, mass, beta, dir, obsdir);
-
   const int Ls=16;
   Grid_init(&argc,&argv);
 
@@ -132,11 +126,15 @@ int main (int argc, char ** argv)
   GridCartesian         * FGrid   = SpaceTimeGrid::makeFiveDimGrid(Ls,UGrid);
   GridRedBlackCartesian * FrbGrid = SpaceTimeGrid::makeFiveDimRedBlackGrid(Ls,UGrid);
 
-  const int Nt = UGrid->_fdimensions[Tdir];
+  const double mass = 0.4;
+  const double beta = 11.08;
+  const int Nt=8;
 
-  std::cout << "mass=" << mass << " beta=" << beta << " Nt=" << Nt << std::endl;
+  std::cout << "beta = " << beta << std::endl;
   WilsonGaugeActionR Waction(beta);
 
+  std::string dir = "/mnt/baracuda_14/grid_claude/16c";
+  std::string obsdir = "/mnt/baracuda_14/grid_claude/16c_obs";
   std::filesystem::create_directories(obsdir);
 
   RealD M5=1.5;
