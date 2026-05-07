@@ -153,6 +153,7 @@ int main (int argc, char ** argv)
       Gamma::Algebra::GammaX,
       Gamma::Algebra::GammaXGamma5,
     };
+    const std::vector<std::string> gam_names = {"id", "g5", "gx", "gxg5"};
     std::vector<LatticeComplex> res(4, LatticeComplex(UGrid));
     for(auto &r : res) r = Zero();
 
@@ -174,7 +175,7 @@ int main (int argc, char ** argv)
     } // for dilute
 
     for(int ig=0; ig<4; ig++){
-      const std::string path = obsdir + "/disc." + std::to_string(ig) + "." + std::to_string(conf);
+      const std::string path = obsdir + "/disc." + gam_names[ig] + "." + std::to_string(conf);
       emptyUserRecord record;
       ScidacWriter WR(UGrid->IsBoss());
       WR.open(path);
