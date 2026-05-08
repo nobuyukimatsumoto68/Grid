@@ -174,7 +174,31 @@ int main (int argc, char ** argv)
             << " interval=" << interval << std::endl;
 
 
+  const std::vector<Gamma::Algebra> gams = {
+    Gamma::Algebra::Identity,
+    Gamma::Algebra::Gamma5,
+    Gamma::Algebra::GammaX,
+    Gamma::Algebra::GammaY,
+    Gamma::Algebra::GammaZ,
+    Gamma::Algebra::GammaT,
+    Gamma::Algebra::GammaXGamma5,
+    Gamma::Algebra::GammaYGamma5,
+    Gamma::Algebra::GammaZGamma5,
+    Gamma::Algebra::GammaTGamma5,
+  };
+  const std::vector<std::string> gam_names = {"id", "g5", "gx", "gy", "gz", "gt", "gxg5", "gyg5", "gzg5", "gtg5"};
   for(int conf=conf_min; conf<conf_max; conf+=interval){
+    {
+      bool all_done = true;
+      for(int ig=0; ig<(int)gam_names.size(); ig++){
+        const std::string path = obsdir + "/disc." + gam_names[ig] + "." + std::to_string(conf);
+        if(!std::filesystem::exists(path)){ all_done = false; break; }
+      }
+      if(all_done){
+        std::cout << GridLogMessage << "skipping conf " << conf << " (output exists)" << std::endl;
+        continue;
+      }
+    }
     {
       const std::string path = dir+"/"+lat_prefix+std::to_string(conf);
       FieldMetaData header;
@@ -183,14 +207,7 @@ int main (int argc, char ** argv)
     }
     FermionAction FermAct(Umu, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mass, M5, b, c, Params);
 
-    const std::vector<Gamma::Algebra> gams = {
-      Gamma::Algebra::Identity,
-      Gamma::Algebra::Gamma5,
-      Gamma::Algebra::GammaX,
-      Gamma::Algebra::GammaXGamma5,
-    };
-    const std::vector<std::string> gam_names = {"id", "g5", "gx", "gxg5"};
-    std::vector<LatticeComplex> res(4, LatticeComplex(UGrid));
+    std::vector<LatticeComplex> res(gam_names.size(), LatticeComplex(UGrid));
     for(auto &r : res) r = Zero();
 
     for(int t=0; t<Nt; t++){
@@ -203,14 +220,14 @@ int main (int argc, char ** argv)
         Solve(FermAct, source, StochProp);
 
         LatticeComplex Trace_CF( UGrid );
-        for(int ig=0; ig<4; ig++){
+        for(int ig=0; ig<(int)gam_names.size(); ig++){
           TraceField(Trace_CF, gams[ig], StochProp, source);
           res[ig] = res[ig] + Trace_CF;
         }
       }
     } // for dilute
 
-    for(int ig=0; ig<4; ig++){
+    for(int ig=0; ig<(int)gam_names.size(); ig++){
       const std::string path = obsdir + "/disc." + gam_names[ig] + "." + std::to_string(conf);
       emptyUserRecord record;
       ScidacWriter WR(UGrid->IsBoss());
