@@ -151,13 +151,18 @@ int main (int argc, char ** argv)
   GridParallelRNG  RNG4(UGrid);
 
   int conf_min, conf_max, interval;
+  std::string lat_prefix;
   {
     std::vector<int> confs;
-    const std::string prefix = "ckpoint_lat.";
+    const std::string suffix = "_lat.";
     for(const auto& entry : std::filesystem::directory_iterator(dir)){
       const std::string fname = entry.path().filename().string();
-      if(fname.rfind(prefix, 0) == 0)
-        confs.push_back(std::stoi(fname.substr(prefix.size())));
+      const auto pos = fname.rfind(suffix);
+      if(pos == std::string::npos) continue;
+      const std::string numstr = fname.substr(pos + suffix.size());
+      if(numstr.empty() || !std::all_of(numstr.begin(), numstr.end(), ::isdigit)) continue;
+      if(lat_prefix.empty()) lat_prefix = fname.substr(0, pos + suffix.size());
+      confs.push_back(std::stoi(numstr));
     }
     assert(!confs.empty());
     std::sort(confs.begin(), confs.end());
@@ -171,7 +176,7 @@ int main (int argc, char ** argv)
 
   for(int conf=conf_min; conf<conf_max; conf+=interval){
     {
-      const std::string path = dir+"/ckpoint_lat."+std::to_string(conf);
+      const std::string path = dir+"/"+lat_prefix+std::to_string(conf);
       FieldMetaData header;
       NerscIO::readConfiguration(Umu, header, path);
       RNG4.SeedUniqueString(path);
