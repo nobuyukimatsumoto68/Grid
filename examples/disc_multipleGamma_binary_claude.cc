@@ -134,7 +134,8 @@ int main (int argc, char ** argv)
 
   const int Nt = UGrid->_fdimensions[Tdir];
 
-  std::cout << "mass=" << mass << " beta=" << beta << " Nt=" << Nt << std::endl;
+  std::cout << "# mass=" << mass << " beta=" << beta << " Nt=" << Nt << std::endl;
+  std::cout << "# dir = " << dir << " obsdir = " << obsdir << std::endl;
   WilsonGaugeActionR Waction(beta);
 
   std::filesystem::create_directories(obsdir);
