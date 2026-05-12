@@ -174,7 +174,7 @@ int main (int argc, char ** argv)
     } // for dilute
 
     for(int ig=0; ig<4; ig++){
-      const std::string path = obsdir + "/disc." + std::to_string(ig) + "." + std::to_string(conf);
+      const std::string path = obsdir + "/traces." + std::to_string(ig) + "." + std::to_string(conf);
       emptyUserRecord record;
       ScidacWriter WR(UGrid->IsBoss());
       WR.open(path);

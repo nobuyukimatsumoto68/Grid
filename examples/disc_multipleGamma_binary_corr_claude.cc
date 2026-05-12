@@ -118,8 +118,8 @@ int main (int argc, char ** argv)
 {
   double mass   = 0.4;
   double beta   = 11.08;
-  std::string dir    = "/mnt/baracuda_14/grid_claude/16c";
-  std::string obsdir = "/mnt/baracuda_14/grid_claude/16c_obs";
+  std::string dir    = "";
+  std::string obsdir = "/mnt/baracuda_14/grid_claude/obs_nc4nf1_2448/obs_nc4nf1_2448_b11p045_m0p4000";
   ParseArgs(argc, argv, mass, beta, dir, obsdir);
 
   const int Ls=16;
@@ -137,7 +137,7 @@ int main (int argc, char ** argv)
   std::cout << "mass=" << mass << " beta=" << beta << " Nt=" << Nt << std::endl;
   WilsonGaugeActionR Waction(beta);
 
-  std::filesystem::create_directories(obsdir);
+  // std::filesystem::create_directories(obsdir);
 
   RealD M5=1.5;
   RealD b=1.5;
@@ -147,20 +147,18 @@ int main (int argc, char ** argv)
   FermionAction::ImplParams Params(boundary);
 
   LatticeGaugeField Umu(UGrid);
-  GridParallelRNG  RNG4(UGrid);
+  // GridParallelRNG  RNG4(UGrid);
 
   int conf_min, conf_max, interval;
-  std::string lat_prefix;
   {
     std::vector<int> confs;
-    const std::string suffix = "_lat.";
-    for(const auto& entry : std::filesystem::directory_iterator(dir)){
+    const std::string prefix = "traces.id.";
+    for(const auto& entry : std::filesystem::directory_iterator(obsdir)){
       const std::string fname = entry.path().filename().string();
-      const auto pos = fname.rfind(suffix);
-      if(pos == std::string::npos) continue;
-      const std::string numstr = fname.substr(pos + suffix.size());
+      if(fname.size() <= prefix.size()) continue;
+      if(fname.substr(0, prefix.size()) != prefix) continue;
+      const std::string numstr = fname.substr(prefix.size());
       if(numstr.empty() || !std::all_of(numstr.begin(), numstr.end(), ::isdigit)) continue;
-      if(lat_prefix.empty()) lat_prefix = fname.substr(0, pos + suffix.size());
       confs.push_back(std::stoi(numstr));
     }
     assert(!confs.empty());
@@ -186,56 +184,92 @@ int main (int argc, char ** argv)
     Gamma::Algebra::GammaTGamma5,
   };
   const std::vector<std::string> gam_names = {"id", "g5", "gx", "gy", "gz", "gt", "gxg5", "gyg5", "gzg5", "gtg5"};
+
+  std::vector<ComplexD> G(Nt, 0.0);
+
   for(int conf=conf_min; conf<conf_max; conf+=interval){
     {
-      bool all_done = true;
+      bool all_there = true;
       for(int ig=0; ig<(int)gam_names.size(); ig++){
         const std::string path = obsdir + "/traces." + gam_names[ig] + "." + std::to_string(conf);
-        if(!std::filesystem::exists(path)){ all_done = false; break; }
+        if(!std::filesystem::exists(path)){
+          all_there = false;
+          break;
+        }
       }
-      if(all_done){
-        std::cout << GridLogMessage << "skipping conf " << conf << " (output exists)" << std::endl;
+      if(!all_there){
+        std::cout << GridLogMessage << "skipping conf " << conf << " (output incomplete)" << std::endl;
         continue;
       }
     }
+
+    // std::vector<LatticeComplex> res(gam_names.size(), LatticeComplex(UGrid));
+    LatticeComplex lat(UGrid);
+    lat = Zero();
+    // for(auto &r : lat) r = Zero();
+    // for(int ig=0; ig<(int)gam_names.size(); ig++)
+    const int ig=0; // test
     {
-      const std::string path = dir+"/"+lat_prefix+std::to_string(conf);
-      FieldMetaData header;
-      NerscIO::readConfiguration(Umu, header, path);
-      RNG4.SeedUniqueString(path);
-    }
-    FermionAction FermAct(Umu, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mass, M5, b, c, Params);
-
-    std::vector<LatticeComplex> res(gam_names.size(), LatticeComplex(UGrid));
-    for(auto &r : res) r = Zero();
-
-    for(int t=0; t<Nt; t++){
-      for(int eo=0; eo<=1; eo++){
-        LatticePropagator source(UGrid);
-
-        StochasticDilutedSource(RNG4, source, UrbGrid, t, eo);
-
-        LatticePropagator StochProp(UGrid);
-        Solve(FermAct, source, StochProp);
-
-        LatticeComplex Trace_CF( UGrid );
-        for(int ig=0; ig<(int)gam_names.size(); ig++){
-          TraceField(Trace_CF, gams[ig], StochProp, source);
-          res[ig] = res[ig] + Trace_CF;
-        }
-      }
-    } // for dilute
-
-    for(int ig=0; ig<(int)gam_names.size(); ig++){
       const std::string path = obsdir + "/traces." + gam_names[ig] + "." + std::to_string(conf);
       emptyUserRecord record;
-      ScidacWriter WR(UGrid->IsBoss());
-      WR.open(path);
-      WR.writeScidacFieldRecord(res[ig], record);
-      WR.close();
+      ScidacReader RD;
+      RD.open(path);
+      // RD.readScidacFieldRecord(lat[ig], record);
+      RD.readScidacFieldRecord(lat, record);
+      RD.close();
+      std::cout << GridLogMessage
+                << "conf " << conf << " " << gam_names[ig]
+                << " norm2=" << norm2(lat) << std::endl;
     }
 
-  } // conf
+    // FFT
+    LatticeComplex ft(UGrid);
+    ft = Zero();
+    FFT theFFT(UGrid);
+    theFFT.FFT_all_dim(ft, lat, FFT::forward);
+
+    // Gtilde[t] = sum_p ft(-p)*ft(p)*exp(i*pt*t), ft(-p)=conj(ft(p)) for real lat
+    LatticeComplex Gtilde(UGrid);
+    Gtilde = adj(ft) * ft;
+
+    // G = IFFT(A), A[n] = sum_spatial product; computed as backward FFT then sliceSum
+    LatticeComplex G_field(UGrid);
+    theFFT.FFT_dim(G_field, Gtilde, Tdir, FFT::backward);
+
+    std::vector<TComplex> G_slices(Nt);
+    sliceSum(G_field, G_slices, Tdir);
+
+    // std::vector<ComplexD> G(Nt);
+    const ComplexD vol = UGrid->_gsites;
+    for(int t=0; t<Nt; t++) G[t] += vol * TensorRemove(G_slices[t]);
+
+    // {
+    //   const std::string path = dir+"/"+lat_prefix+std::to_string(conf);
+    //   FieldMetaData header;
+    //   NerscIO::readConfiguration(Umu, header, path);
+    //   RNG4.SeedUniqueString(path);
+    // }
+    // FermionAction FermAct(Umu, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mass, M5, b, c, Params);
+  }
+
+
+  for(int t=0; t<Nt; t++){
+    std::cout << t << "\t" << real(G[t]) << "\t" << imag(G[t]) << std::endl;
+      // for(int eo=0; eo<=1; eo++){
+      //   LatticePropagator source(UGrid);
+
+      //   StochasticDilutedSource(RNG4, source, UrbGrid, t, eo);
+
+      //   LatticePropagator StochProp(UGrid);
+      //   Solve(FermAct, source, StochProp);
+
+      //   LatticeComplex Trace_CF( UGrid );
+      //   for(int ig=0; ig<(int)gam_names.size(); ig++){
+      //     TraceField(Trace_CF, gams[ig], StochProp, source);
+      //     res[ig] = res[ig] + Trace_CF;
+      //   }
+      // }
+  } // for dilute
 
   Grid_finalize();
 }
