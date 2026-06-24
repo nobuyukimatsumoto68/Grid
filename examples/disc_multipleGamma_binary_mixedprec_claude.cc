@@ -5,6 +5,18 @@
 
 #include <Grid/Grid.h>
 
+// Mixed-precision variant of disc_multipleGamma_binary_claude.cc.
+// The ONLY physics change is the linear solver: the inner CG iterations run in
+// SINGLE precision with a DOUBLE reliable-update outer loop
+// (MixedPrecisionConjugateGradient), keeping the SAME 1e-8 outer residual. On
+// MI300A this roughly halves the per-config wall time (FP32 ~2x FP64, the Mobius
+// apply is bandwidth-bound). Source, dilution, contraction, I/O and the
+// wall-time blocker are byte-for-byte identical to the double-precision binary.
+//
+// Mixed-precision reliable-update CG: M. A. Clark et al., arXiv:0911.3191
+// (Comput.Phys.Commun. 181 (2010) 1517); reliable update: Sleijpen & van der
+// Vorst, Computing 56 (1996) 141. Grid class MixedPrecisionConjugateGradient.
+
 using namespace std;
 using namespace Grid;
 
@@ -74,8 +86,24 @@ void StochasticDilutedSource(GridParallelRNG &RNG, LatticePropagator &source,
 }
 
 
-template<class Action>
-void Solve(Action &D,LatticePropagator &source,LatticePropagator &propagator)
+// Adapt a LinearFunction (e.g. MixedPrecisionConjugateGradient, which already
+// owns its single+double operators) to the OperatorFunction interface that
+// SchurRedBlack*Solve expects (3-arg (Linop,in,out)). The Linop the Schur
+// wrapper passes is IGNORED -- mCG holds the identical Schur operator itself.
+template<class Field>
+class LinearFunctionAsOperatorFunction : public OperatorFunction<Field>
+{
+  LinearFunction<Field> &_fn;
+public:
+  using OperatorFunction<Field>::operator();
+  LinearFunctionAsOperatorFunction(LinearFunction<Field> &fn) : _fn(fn) {}
+  void operator()(LinearOperatorBase<Field> &Linop, const Field &in, Field &out){
+    _fn(in, out);
+  }
+};
+
+template<class Action, class ActionF>
+void Solve(Action &D, ActionF &D_f, LatticePropagator &source, LatticePropagator &propagator)
 {
   GridBase *UGrid = D.GaugeGrid();
   GridBase *FGrid = D.FermionGrid();
@@ -85,8 +113,22 @@ void Solve(Action &D,LatticePropagator &source,LatticePropagator &propagator)
   LatticeFermion result5(FGrid);
   LatticeFermion result4(UGrid);
 
-  ConjugateGradient<LatticeFermion> CG(1.0e-8,100000);
-  SchurRedBlackDiagMooeeSolve<LatticeFermion> schur(CG);
+  // --- double-precision reference solver (kept for A/B; see the unchanged
+  // --- double-precision binary disc_multipleGamma_binary_claude.cc) ---
+  // ConjugateGradient<LatticeFermion> CG(1.0e-8,100000);
+  // SchurRedBlackDiagMooeeSolve<LatticeFermion> schur(CG);
+
+  // --- mixed-precision solver: single inner / double reliable-update outer,
+  // --- same 1e-8 outer residual (arXiv:0911.3191). The Schur-preconditioned
+  // --- (even/odd) operator is built in both precisions; the single one drives
+  // --- the inner CG, the double one the outer correction.
+  SchurDiagMooeeOperator<Action, LatticeFermion>   HermOpEO  (D);
+  SchurDiagMooeeOperator<ActionF, LatticeFermionF> HermOpEO_f(D_f);
+  MixedPrecisionConjugateGradient<LatticeFermion, LatticeFermionF>
+    mCG(1.0e-8, 10000, 50, D_f.FermionRedBlackGrid(), HermOpEO_f, HermOpEO);
+  LinearFunctionAsOperatorFunction<LatticeFermion> mCGop(mCG);
+  SchurRedBlackDiagMooeeSolve<LatticeFermion> schur(mCGop);
+
   ZeroGuesser<LatticeFermion> ZG; // Could be a DeflatedGuesser if have eigenvectors
   for(int s=0;s<Nd;s++){
     for(int c=0;c<Nc;c++){
@@ -134,6 +176,14 @@ int main (int argc, char ** argv)
   GridCartesian         * FGrid   = SpaceTimeGrid::makeFiveDimGrid(Ls,UGrid);
   GridRedBlackCartesian * FrbGrid = SpaceTimeGrid::makeFiveDimRedBlackGrid(Ls,UGrid);
 
+  // single-precision grids for the inner CG of the mixed-precision solver.
+  GridCartesian         * UGrid_f   = SpaceTimeGrid::makeFourDimGrid(GridDefaultLatt(),
+                                                                     GridDefaultSimd(Nd,vComplexF::Nsimd()),
+                                                                     GridDefaultMpi());
+  GridRedBlackCartesian * UrbGrid_f = SpaceTimeGrid::makeFourDimRedBlackGrid(UGrid_f);
+  GridCartesian         * FGrid_f   = SpaceTimeGrid::makeFiveDimGrid(Ls,UGrid_f);
+  GridRedBlackCartesian * FrbGrid_f = SpaceTimeGrid::makeFiveDimRedBlackGrid(Ls,UGrid_f);
+
   const int Nt = UGrid->_fdimensions[Tdir];
 
   std::cout << "# mass=" << mass << " beta=" << beta << " Nt=" << Nt << std::endl;
@@ -147,9 +197,11 @@ int main (int argc, char ** argv)
   RealD c=0.5;
   std::vector<Complex> boundary = {1,1,1,-1};
   typedef MobiusFermionD FermionAction;
+  typedef MobiusFermionF FermionActionF;
   FermionAction::ImplParams Params(boundary);
 
-  LatticeGaugeField Umu(UGrid);
+  LatticeGaugeField  Umu(UGrid);
+  LatticeGaugeFieldF Umu_f(UGrid_f);   // single-precision copy, refreshed per config
   GridParallelRNG  RNG4(UGrid);
 
   int conf_min, conf_max, interval;
@@ -243,7 +295,11 @@ int main (int argc, char ** argv)
       NerscIO::readConfiguration(Umu, header, path);
       RNG4.SeedUniqueString(path);
     }
-    FermionAction FermAct(Umu, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mass, M5, b, c, Params);
+    // refresh the single-precision gauge copy for this config's inner solves.
+    precisionChange(Umu_f, Umu);
+
+    FermionAction  FermAct  (Umu,   *FGrid,   *FrbGrid,   *UGrid,   *UrbGrid,   mass, M5, b, c, Params);
+    FermionActionF FermAct_f(Umu_f, *FGrid_f, *FrbGrid_f, *UGrid_f, *UrbGrid_f, mass, M5, b, c, Params);
 
     std::vector<LatticeComplex> res(gam_names.size(), LatticeComplex(UGrid));
     for(auto &r : res) r = Zero();
@@ -255,7 +311,7 @@ int main (int argc, char ** argv)
         StochasticDilutedSource(RNG4, source, UrbGrid, t, eo);
 
         LatticePropagator StochProp(UGrid);
-        Solve(FermAct, source, StochProp);
+        Solve(FermAct, FermAct_f, source, StochProp);
 
         LatticeComplex Trace_CF( UGrid );
         for(int ig=0; ig<(int)gam_names.size(); ig++){
