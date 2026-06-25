@@ -126,6 +126,10 @@ void Solve(Action &D, ActionF &D_f, LatticePropagator &source, LatticePropagator
   SchurDiagMooeeOperator<ActionF, LatticeFermionF> HermOpEO_f(D_f);
   MixedPrecisionConjugateGradient<LatticeFermion, LatticeFermionF>
     mCG(1.0e-8, 10000, 50, D_f.FermionRedBlackGrid(), HermOpEO_f, HermOpEO);
+  // loosen the inner single-CG tolerance (default 1e-8 forces ~3 full outer iters
+  // and kills the mixed-prec gain; 1e-4 gives the measured ~1.4x). Outer tol stays
+  // 1e-8. Env-overridable per disc_tuning_routine_claude.md.
+  { const char* e = std::getenv("INNER_TOL"); mCG.InnerTolerance = e ? std::atof(e) : 1.0e-4; }
   LinearFunctionAsOperatorFunction<LatticeFermion> mCGop(mCG);
   SchurRedBlackDiagMooeeSolve<LatticeFermion> schur(mCGop);
 

@@ -37,7 +37,19 @@ in the next build). The bottom is DENSE -- 20 modes barely double:
 | 9 | 6.054e-4 | 19 | 9.052e-4 |
 
 eval[0..19] span $[4.83, 9.05]\times10^{-4}$ -- a dense near-zero cluster (light-mass
-Banks-Casher regime). eval[20..99] PENDING (next run prints the full 100).
+Banks-Casher regime). FULL 100-mode spectrum (run `disc_bench_f3GHQ9uSeMyh`,
+2026-06-24): grows $\sim$20x over 100 modes (densest at the very bottom, spreading
+higher). eval[i] (i:value):
+```
+ 0:4.832e-4   5:5.359e-4  10:6.512e-4  15:7.464e-4  20:9.823e-4
+25:1.199e-3  30:1.523e-3  35:1.734e-3  40:2.237e-3  45:2.718e-3
+50:3.126e-3  55:3.662e-3  60:4.328e-3  65:4.945e-3  70:5.625e-3
+75:6.144e-3  80:6.849e-3  85:7.775e-3  90:8.612e-3  95:9.209e-3  99:9.728e-3
+```
+(full per-index list in the log). eval[100] would be $\sim10^{-2}$ -> deflating 100
+modes lifts the effective floor from $4.8\times10^{-4}$ to $\sim10^{-2}$ (a $\sim$20x
+lift -> $\sqrt{}\sim4.5$x in the deflated-mode condition, but the SOLVE only needs to
+converge the undeflated tail, see sweep).
 
 ## Eigensolve (shift-invert / inverse Lanczos)
 - Method: `EIG_METHOD=2`, Lanczos on $\hat H^{-1}$ (inner CG to `INV_TOL=1e-4`),
@@ -47,12 +59,27 @@ Banks-Casher regime). eval[20..99] PENDING (next run prints the full 100).
   robust choice for this wide/dense spectrum.
 
 ## Nev sweep -- 16-RHS batched mixed-prec solve (outer tol 1e-8)
-| Nev | wall (16 RHS) | speedup vs Nev=0 | notes |
-|-----|---------------|------------------|-------|
-| 0   | 163.7 s | 1.00x | baseline, $\sim$3000 inner iters/RHS, 3 outer iters |
-| 25  | 129.9 s | 1.26x | inner iters $\sim$2690 |
-| 50  | PENDING | -- | aborted: `MAXPATCH=50` too small (needed 51); fixed -> 1000 |
-| 100 | PENDING | -- | -- |
+Run `disc_bench_f3GHQ9uSeMyh` (2026-06-24), MAXPATCH=1000, full sweep completed.
+| Nev | wall (16 RHS) | speedup vs Nev=0 |
+|-----|---------------|------------------|
+| 0   | 168.0 s | 1.00x |
+| 25  | 131.9 s | 1.27x |
+| 50  | 115.6 s | 1.45x |
+| 100 | 106.4 s | 1.58x |
+Solve decrements: 168.0 -> 131.9 (-36.1) -> 115.6 (-16.3) -> 106.4 (-9.2 over 50):
+decelerating but NOT yet plateaued.
+
+## Break-even (per config = setup + 96 source groups), setup(Nev) ~ (Nev/100)*627 s
+| Nev | setup | 96*solve | T(Nev) | per-config speedup |
+|-----|-------|----------|--------|--------------------|
+| 0   | 0 s    | 16132 s | 16132 s | 1.00x |
+| 25  | 157 s  | 12663 s | 12820 s | 1.26x |
+| 50  | 314 s  | 11102 s | 11416 s | 1.41x |
+| 100 | 627 s  | 10213 s | 10840 s | 1.49x |
+Marginal (50->100): solve saves 889 s/config, setup adds 313 s -> NET -576 s, i.e.
+benefit 17.8 s/mode > cost 6.3 s/mode -> the SPEED optimum is somewhat BEYOND 100,
+but absolute per-config gain is modest (~1.5x) and shrinking. A bigger Nev is the
+variance/LMA lever (future), not a speed win.
 
 ## Implications
 - Deflation works but with DIMINISHING RETURNS here: the dense low spectrum means
@@ -68,8 +95,37 @@ Banks-Casher regime). eval[20..99] PENDING (next run prints the full 100).
   work substantially -- revisit before trusting absolute speedups vs the production
   double-prec solve.
 
-## Pending
-- Rebuild + resubmit (MAXPATCH=1000, full-spectrum print) -> Nev=50/100 timings +
-  the complete 100-mode eval list (append here).
-- Then go/no-go on the production deflation variant (Chunk D) given the modest
-  speedup, weighed against the disc-estimator stabilization benefit at light mass.
+## Solver comparison (run disc_bench_f3GJdphTkejq, 2026-06-24, Nev=0, InnerTol=1e-4)
+| solver | wall | per-RHS |
+|--------|------|---------|
+| plain DOUBLE CG (1 RHS)      | 12.71 s | 12.71 s |
+| mixed-prec CG (1 RHS)        |  8.86 s |  8.86 s |
+| mixed-prec BATCHED (16 RHS)  | 139.6 s |  **8.72 s** |
+=> **mixed-prec is ~1.43x over plain double** (chunk #1 pays off). **BATCHING gives
+~NO gain** (8.72 vs 8.86 s/RHS) -- on this APU/operator the multi-RHS solve does not
+amortize (chunk #2 not helping at Nev=0). Corrects an earlier worry: production
+double at m=0.01 is ~12.7 s/solve (the memory "950s/config" was a HEAVIER ensemble),
+so mixed-prec is a genuine speedup, not a regression.
+OPEN: does batching help WITH deflation? (deflation projection is batched) -> being
+measured via DO_BATCHCMP (batch=1 vs 16 at Nev=100) in the next run.
+
+## NaN breakdown at 200 modes (same run)
+shift-invert Lanczos with INV_TOL=1e-4 broke down at step 200: `alpha[200]=(-nan)
+beta[200]=nan`, converged 0/200, then the inner CG spun on the NaN source to maxit.
+100 modes was fine -> the inexact inner solve (1e-4) loses orthogonality pushing to
+200. FIX: INV_TOL=1e-5, NSTOP capped at 150, + NaN guard in InverseHermOp (bail on
+non-finite/zero source). The whole Nev sweep produced nothing that run.
+
+## Pending / open
+- DECISION (Chunk B): per-config speed gain is only ~1.5x at Nev=100 and the
+  shift-invert setup is 627 s/config -- modest. Go/no-go on the production variant
+  (Chunk D) hinges on the EFFICIENCY issue below + the variance/LMA benefit.
+- **CRITICAL open**: the mixed-prec batched solve is 106-168 s / 16 RHS
+  = 6.6-10.5 s/solve, doing 3 FULL outer iters (InnerTolerance=1e-8). Must (a)
+  compare to the CURRENT production PLAIN-DOUBLE CG at m=0.01 (the disc binary's
+  SchurRedBlackDiagMooee, tol 1e-8) -- if production double is much faster, the
+  mixed-prec batched path is a REGRESSION; and (b) loosen InnerTolerance (~1e-4)
+  and re-measure the baseline before trusting any speedup. THIS dominates the
+  go/no-go, more than Nev tuning.
+- If pursued: Chunk D production variant + (future) LMA for the disc estimator
+  variance (see impl-plan "FUTURE DIRECTION").

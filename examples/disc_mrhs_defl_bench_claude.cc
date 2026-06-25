@@ -1,6 +1,7 @@
 #include <getopt.h>   // getopt_long for --config/--mass
 #include <cstdlib>    // std::getenv / std::atoi / std::atof
 #include <sstream>    // NEV_LIST parsing
+#include <cmath>      // std::isfinite (InverseHermOp NaN guard)
 #include <Grid/Grid.h>
 
 // disc speedup #2+#3 -- BENCHMARK harness (Chunk A).
@@ -107,6 +108,15 @@ public:
     : _H(H), _tol(tol), _maxit(maxit) {}
   void operator()(const FieldF &in, FieldF &out)
   {
+    // guard: if the Lanczos hands us a non-finite/zero source (breakdown), don't
+    // spin the CG to maxit on a NaN -- bail with a zero correction.
+    RealD n = norm2(in);
+    if(!std::isfinite(n) || n == 0.0){
+      out = Zero();
+      std::cout << GridLogMessage << "# InverseHermOp: non-finite/zero source (norm2="
+                << n << "), skipping CG" << std::endl;
+      return;
+    }
     ConjugateGradient<FieldF> CG(_tol, _maxit, false); // false: don't abort on non-converge
     out = Zero();
     CG(_H, in, out);                                   // out = H^{-1} in
@@ -148,6 +158,8 @@ int main(int argc, char** argv)
   const int    maxinner = env_int("MAXINNER", 10000);
   const int    maxouter = env_int("MAXOUTER", 50);
   const int    maxpatch = env_int("MAXPATCH", 50);
+  const double inner_tol= env_double("INNER_TOL", 1.0e-8); // mixed-prec inner single-CG
+                                                           // rel tol (default = outer tol)
 
   // ---- double + single grids -------------------------------------------------
   GridCartesian         * UGrid   = SpaceTimeGrid::makeFourDimGrid(GridDefaultLatt(),
@@ -225,6 +237,53 @@ int main(int argc, char** argv)
   }
 
   // ======================================================================
+  //  SOLVER COMPARISON (DO_SOLVERCMP), all at Nev=0 (no deflation):
+  //   (a) plain DOUBLE CG (1 RHS)      -- the current production solver,
+  //   (b) mixed-prec CG (1 RHS),       -- chunk #1, single RHS,
+  //   (c) mixed-prec BATCHED (16 RHS). -- chunk #1+#2.
+  //  Mixed variants use InnerTolerance = INNER_TOL (the inner single-CG rel tol).
+  //  Answers: is mixed/batched actually faster than the production double CG?
+  // ======================================================================
+  if(env_int("DO_SOLVERCMP", 0)){
+    std::cout << GridLogMessage << "# ===== SOLVER COMPARISON (Nev=0, InnerTol="
+              << inner_tol << ") =====" << std::endl;
+    LatticeFermion x(FrbGrid);
+
+    // (a) plain double CG, 1 RHS
+    {
+      x = Zero();
+      ConjugateGradient<LatticeFermion> CGd(1.0e-8, 100000);
+      double t0 = usecond();
+      CGd(HermOpEO, rhs[0], x);
+      std::cout << GridLogMessage << "# SOLVERCMP double-CG (1 RHS)   wall="
+                << (usecond()-t0)*1.0e-6 << " s" << std::endl;
+    }
+    // (b) mixed-prec CG, 1 RHS
+    {
+      x = Zero();
+      MixedPrecisionConjugateGradient<LatticeFermion,LatticeFermionF>
+        m1(1.0e-8, maxinner, maxouter, FrbGrid_f, HermOpEO_f, HermOpEO);
+      m1.InnerTolerance = inner_tol;
+      double t0 = usecond();
+      m1(rhs[0], x);
+      std::cout << GridLogMessage << "# SOLVERCMP mixed-CG  (1 RHS)   wall="
+                << (usecond()-t0)*1.0e-6 << " s" << std::endl;
+    }
+    // (c) mixed-prec batched, 16 RHS
+    {
+      for(int r=0; r<nrhs; r++) sol[r] = Zero();
+      MixedPrecisionConjugateGradientBatched<LatticeFermion,LatticeFermionF>
+        mb(1.0e-8, maxinner, maxouter, maxpatch, FrbGrid_f, HermOpEO_f, HermOpEO);
+      mb.InnerTolerance = inner_tol;
+      double t0 = usecond();
+      mb(rhs, sol);
+      double t = (usecond()-t0)*1.0e-6;
+      std::cout << GridLogMessage << "# SOLVERCMP mixed-batched (" << nrhs << " RHS) wall="
+                << t << " s  (= " << t/nrhs << " s/RHS)" << std::endl;
+    }
+  }
+
+  // ======================================================================
   //  Eigenbasis (FANCY): low modes of the single-prec Schur operator, gated by
   //  DO_DEFL (default 1). DO_DEFL=0 = BASIC smoke test: skip Power-method +
   //  Lanczos + deflation entirely and run ONLY the plain Nev=0 batched
@@ -285,6 +344,43 @@ int main(int argc, char** argv)
   }
 
   // ======================================================================
+  //  BATCH-SIZE comparison WITH deflation (DO_BATCHCMP): does multi-RHS amortize
+  //  once deflation is on? Same deflated batched solver at batch size 1 vs nrhs,
+  //  per-RHS. (At Nev=0 batching gave no gain; deflation's projection is batched,
+  //  so this checks whether the deflated case differs.)
+  // ======================================================================
+  if(do_defl && env_int("DO_BATCHCMP", 0) && Nconv > 0){
+    int nv = std::min(env_int("NEV_CMP", 100), Nconv);
+    std::cout << GridLogMessage << "# ===== BATCHCMP (deflated, Nev=" << nv
+              << ", InnerTol=" << inner_tol << ") =====" << std::endl;
+    MultiRHSDeflation<LatticeFermionF> defl;
+    defl.ImportEigenBasis(evec, eval, 0, nv);
+    MrhsDeflationGuesser<LatticeFermionF> guesser(defl);
+
+    // batch size 1
+    {
+      std::vector<LatticeFermion> b1(1, FrbGrid), s1(1, FrbGrid);
+      b1[0] = rhs[0]; s1[0] = Zero();
+      MixedPrecisionConjugateGradientBatched<LatticeFermion,LatticeFermionF>
+        m1(1.0e-8, maxinner, maxouter, maxpatch, FrbGrid_f, HermOpEO_f, HermOpEO);
+      m1.InnerTolerance = inner_tol; m1.useGuesser(guesser);
+      double t0 = usecond(); m1(b1, s1); double t = (usecond()-t0)*1.0e-6;
+      std::cout << GridLogMessage << "# BATCHCMP defl batch=1   wall=" << t
+                << " s  (= " << t << " s/RHS)" << std::endl;
+    }
+    // batch size nrhs
+    {
+      for(int r=0; r<nrhs; r++) sol[r] = Zero();
+      MixedPrecisionConjugateGradientBatched<LatticeFermion,LatticeFermionF>
+        mN(1.0e-8, maxinner, maxouter, maxpatch, FrbGrid_f, HermOpEO_f, HermOpEO);
+      mN.InnerTolerance = inner_tol; mN.useGuesser(guesser);
+      double t0 = usecond(); mN(rhs, sol); double t = (usecond()-t0)*1.0e-6;
+      std::cout << GridLogMessage << "# BATCHCMP defl batch=" << nrhs << "  wall=" << t
+                << " s  (= " << t/nrhs << " s/RHS)" << std::endl;
+    }
+  }
+
+  // ======================================================================
   //  Nev sweep: batched mixed-prec solve of the same 16 RHS, deflating the
   //  lowest Nev modes as the guess. Nev=0 = plain mRHS+mixed (the baseline).
   // ======================================================================
@@ -300,6 +396,7 @@ int main(int argc, char** argv)
     // fresh solver each iteration so the guesser pointer is clean (Nev=0 -> none)
     MixedPrecisionConjugateGradientBatched<LatticeFermion,LatticeFermionF>
       bCG(1.0e-8, maxinner, maxouter, maxpatch, FrbGrid_f, HermOpEO_f, HermOpEO);
+    bCG.InnerTolerance = inner_tol;
 
     // these must outlive the solve below
     MultiRHSDeflation<LatticeFermionF> defl;
