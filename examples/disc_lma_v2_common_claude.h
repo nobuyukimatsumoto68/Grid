@@ -186,7 +186,7 @@ inline void BuildPhysicalA2A(MobiusFermionD &D,
 inline void ComputeChebWindow(bool have_ref, const std::vector<RealD>& lambda_ref,
                               RealD lambda_max, int Nstop,
                               int cheb_lo_auto, double cheb_lo_fac, double cheb_lo_man,
-                              double cheb_hifc, double cheb_gain,
+                              double cheb_hifc, double cheb_gain, double cheb_atop,
                               RealD& cheb_lo, RealD& cheb_hi, int& cheb_o)
 {
   cheb_hi = cheb_hifc * lambda_max;
@@ -200,7 +200,30 @@ inline void ComputeChebWindow(bool have_ref, const std::vector<RealD>& lambda_re
     cheb_lo = cheb_lo_man;
     std::cout << GridLogMessage << "# Cheby lo MANUAL = " << cheb_lo << std::endl;
   }
-  if(cheb_gain > 0.0 && have_ref){
+  // AUTO order. PREFERRED anchor = the BAND-TOP wanted mode lambda_ref[Nstop-1] (the cut
+  // boundary), targeting amplification CHEB_ATOP. This is config-ROBUST: the band-top is
+  // stable across configs, whereas anchoring on lambda_min (the cheb_gain fallback) is
+  // config-DEPENDENT and UNDER-orders near-zero-mode configs (smaller lambda_min -> larger
+  // |y_min| -> smaller degree, i.e. less amplification exactly where it's needed). MEASURED
+  // (m=0.01 lat.758): band-top ~4.6x (CHEB_ATOP~5, order 151) converged 100/100 in 95s with
+  // eval reldiff 9e-7 -- vs gain-1e4 (order 397, 237s, reldiff 4.5e-5, single-prec
+  // over-amplification). CHEB_ATOP<=0 falls back to the gain-on-lambda_min path.
+  if(cheb_atop > 0.0 && have_ref){
+    int icut = std::min(Nstop, (int)lambda_ref.size()) - 1;
+    RealD lcut = lambda_ref[icut];
+    RealD yt   = (lcut - 0.5*(cheb_hi + cheb_lo)) / (0.5*(cheb_hi - cheb_lo));
+    RealD ay   = std::fabs(yt);
+    if(ay > 1.0 + 1.0e-12){
+      int deg = (int)std::ceil(std::acosh(cheb_atop) / std::acosh(ay));
+      if(deg < 2)    deg = 2;
+      if(deg > 4000) deg = 4000;          // sane cap
+      if(deg % 2 != 0) deg += 1;          // EVEN degree
+      cheb_o = deg + 1;                   // order = degree + 1 (ODD)
+      std::cout << GridLogMessage << "# Cheby order AUTO (band-top anchor): A_top=" << cheb_atop
+                << "  lambda_ref[" << icut << "]=" << lcut << "  |y|=" << ay
+                << "  -> degree=" << deg << " (order=" << cheb_o << ")" << std::endl;
+    }
+  } else if(cheb_gain > 0.0 && have_ref){
     RealD lmin = lambda_ref.front();
     RealD ymin = (lmin - 0.5*(cheb_hi + cheb_lo)) / (0.5*(cheb_hi - cheb_lo));
     RealD ay   = std::fabs(ymin);
@@ -210,7 +233,7 @@ inline void ComputeChebWindow(bool have_ref, const std::vector<RealD>& lambda_re
       if(deg > 4000) deg = 4000;          // sane cap
       if(deg % 2 != 0) deg += 1;          // EVEN degree
       cheb_o = deg + 1;                   // order = degree + 1 (ODD)
-      std::cout << GridLogMessage << "# Cheby order AUTO: target gain=" << cheb_gain
+      std::cout << GridLogMessage << "# Cheby order AUTO (lambda_min gain, FALLBACK): gain=" << cheb_gain
                 << "  |y_min|=" << ay << "  -> degree=" << deg
                 << " (order=" << cheb_o << ")" << std::endl;
     }
@@ -292,7 +315,7 @@ struct LMAEigParams {
   double eresid;
   double inv_tol;   int inv_maxit;
   int    eig_method, eig_prec, rr_refine;
-  int    cheb_lo_auto; double cheb_lo_fac, cheb_lo_man, cheb_gain, cheb_hifc;
+  int    cheb_lo_auto; double cheb_lo_fac, cheb_lo_man, cheb_gain, cheb_atop, cheb_hifc;
   int    cheb_o;
 };
 
@@ -312,9 +335,12 @@ inline LMAEigParams ReadLMAEigParams()
   P.cheb_lo_auto = env_int   ("CHEB_LO_AUTO", 1);
   P.cheb_lo_fac  = env_double("CHEB_LO_FAC",  1.5);
   P.cheb_lo_man  = env_double("CHEB_LO",      0.02);
-  // CHEB_ORD must be ODD (=> even degree); asserted in ComputeChebWindow. CHEB_GAIN>0 overrides.
+  // Order precedence: CHEB_ATOP>0 (band-top anchor, PRIMARY) -> CHEB_GAIN>0 (lambda_min,
+  // FALLBACK) -> CHEB_ORD (MANUAL, used only if both <=0). CHEB_ORD must be ODD (=> even
+  // degree); asserted in ComputeChebWindow.
   P.cheb_o    = env_int   ("CHEB_ORD",   61);
-  P.cheb_gain = env_double("CHEB_GAIN",  1.0e4);
+  P.cheb_atop = env_double("CHEB_ATOP",  8.0);   // target band-top amplification (validated ~5)
+  P.cheb_gain = env_double("CHEB_GAIN",  0.0);   // lambda_min gain fallback (off by default now)
   P.cheb_hifc = env_double("CHEB_HI_FAC",1.1);
   P.eig_prec  = env_int   ("EIG_PREC",   1);     // 1 = single, 2 = double
   P.rr_refine = env_int   ("RR_REFINE",  1);
@@ -355,7 +381,7 @@ inline void BuildLowModes(MobiusFermionD &D, MobiusFermionF &D_f,
       lmax = PM(HermOpEO_f, pm_src);
     }
     ComputeChebWindow(have_ref, lambda_ref, lmax, P.Nstop, P.cheb_lo_auto, P.cheb_lo_fac,
-                      P.cheb_lo_man, P.cheb_hifc, P.cheb_gain, cheb_lo, cheb_hi, cheb_ord_use);
+                      P.cheb_lo_man, P.cheb_hifc, P.cheb_gain, P.cheb_atop, cheb_lo, cheb_hi, cheb_ord_use);
   }
 
   if(P.eig_prec == 2){
