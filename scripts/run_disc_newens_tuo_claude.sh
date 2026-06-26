@@ -1,4 +1,15 @@
 #!/bin/bash
+#
+# Driver (run from workdir) for the DISCONNECTED loop correlator
+# (disc_multipleGamma_binary_claude) on the NEW light-mass ensembles
+# (mass 0.01 @ beta 10.8, mass 0.05 @ beta 10.84) in conf_nc4nf1_2448.
+# Same logic as run_disc_multipleGamma_binary_claude_tuo.sh, but loops the two
+# new ensembles via index-aligned arrays; reuses submit_disc_tuolumne.sh.
+#
+# The disc binary auto-detects the config range from latdir and loops internally
+# at the native config interval (= 4 for these ensembles). NOTE: the connected
+# side (run_meson_momproj_newens_tuo_claude.sh) MUST use the SAME config set so
+# they combine as 2D - C; if you thin one, thin the other identically.
 
 date; hostname
 
@@ -8,12 +19,12 @@ source env.sh
 builddir=/usr/workspace/lsd/matsumoto5/su4_32c/build
 make -C ${builddir}/examples disc_multipleGamma_binary_claude
 
-# All four original ensembles (index-aligned arrays). beta is the float passed
-# to the binary; betastr/massstr build the directory names.
-masses=(0.4     0.3     0.2     0.1)
-massstrs=(0p4000 0p3000 0p2000 0p1000)
-betas=(11.045   11.035  10.99   10.865)
-betastrs=(11p045 11p035 10p990 10p865)
+# New ensembles to process (index-aligned arrays). beta is the float passed to
+# the binary; betastr/massstr build the directory names.
+masses=(0.01    0.05)
+massstrs=(0p0100 0p0500)
+betas=(10.8     10.84)
+betastrs=(10p800 10p840)
 
 script=submit_disc_tuolumne.sh
 
@@ -27,8 +38,8 @@ do
     beta=${betas[$j]}
     betastr=${betastrs[$j]}
 
-
-    latdir="/p/lustre5/matsumoto5/conf_nc4nf1_2448/conf_nc4nf1_2448_b${betastr}_m${massstr}"
+    cfgfilename="conf_nc4nf1_2448_b${betastr}_m${massstr}"
+    latdir="/p/lustre5/matsumoto5/conf_nc4nf1_2448/${cfgfilename}"
     obsdir="/p/lustre5/matsumoto5/obs_nc4nf1_2448/obs_nc4nf1_2448_b${betastr}_m${massstr}"
 
     rundir=$obsdir
@@ -52,6 +63,6 @@ do
         deps="${deps} --dependency=afterany:$1"
     fi
 
-    echo "submitting ${jobname}${deps:+ (deps:${deps# })}"
+    echo "submitting ${cfgfilename} as ${jobname}${deps:+ (deps:${deps# })}"
     flux batch --job-name=${jobname} ${deps} --env=builddir=$builddir --env=mass=$mass --env=beta=$beta --env=latdir=$latdir --env=obsdir=$obsdir $script
 done

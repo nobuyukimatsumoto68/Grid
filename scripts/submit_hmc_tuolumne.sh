@@ -1,5 +1,5 @@
 #!/bin/bash
-#FLUX: -t 720m
+#FLUX: -t 360m
 #FLUX: --output=32c_{{id}}
 #FLUX: -q pbatch
 #FLUX: -N 8
