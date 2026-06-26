@@ -1,5 +1,78 @@
 # disc LMA + eigensolve -- HANDOFF (2026-06-25)
 
+## REPLY (2026-06-25, local session) -- CHEBYSHEV EIGENSOLVE NOW CONVERGES
+Picked this up locally and resolved the long-standing "Chebyshev never converges" item (Sec 5).
+The Cheby IRL now converges cleanly; full state in machine memory
+`project_disc_lma_cheby_v2_state.md` and design doc `examples/disc_lma_cheby_v2_impl_plan_claude.md`.
+New files (never edited the originals): `examples/disc_lma_bench_v2_claude.cc` (Cheby bench),
+`examples/disc_lma_eigref_v2_claude.cc` (shift-invert pre-calc -> eigref HDF5), repo-root
+`tmp_claude.sh` (build+run). Tested on a SMALL local testbed: **HOT** (random) gauge, 4^4, Ls16,
+m=0.01 (free/cold is unusable -- see below). What was wrong, in order found:
+1. getopt: leading `+` + ParseArgs-before-Grid_init silently dropped CLI flags. (Grid_init first; drop `+`.)
+2. FREE/cold gauge is EXACTLY degenerate (lambda_min mult ~24) -> single-vector Lanczos breaks
+   down to nan. Use HOT (random) gauge to lift it (like a real config).
+3. **Chebyshev DEGREE must be EVEN.** Grid `Chebyshev(lo,hi,order)` = T_{order-1}; IRL keeps the
+   LARGEST filtered evals (partial_sort greater). T_odd(y<-1) -> -large, so IRL locked onto BULK
+   modes near +1 (spurious eval ~32, nan). Force ODD order (=even degree). THIS was the core bug.
+4. High-order single Cheby hits the single-prec residual floor (eresid^2=1e-12 normalized
+   unreachable) -> single Cheby supplies the SUBSPACE only, then **double Rayleigh-Ritz refine**.
+5. Order MUST be auto-derived from a target gain (CHEB_GAIN~1e4): a fixed order over-amplified to
+   ~7e12 on 4^4 -> single-prec Lanczos fluctuated. degree ~ acosh(gain)/acosh|y_min|.
+6. Reconstruction GPU crash: ran GATE2 (5 full-5D fields/mode) for every mode though only printed
+   for i<Ncheck -> gate the GATES behind i<Ncheck; and don't clear()/shrink_to_fit() the evec store
+   (tripped Grid AccCache.bytes==bytes) -- emplace_back/swap instead.
+Working recipe (bench env): `EIG_PREC=1 EIG_METHOD=1 RR_REFINE=1 NSTOP=12 NK=24 NM=120 CHEB_GAIN=1e4
+CHEB_LO_FAC=1.02 ERESID=1e-4`. Result: auto order 83, amplification 1e4, 12/12 converged
+(reldiff 1.4e-8), RR refine, reconstruction completes (GATE1 ~2e-5), no crash.
+VERDICT: Cheby IS viable with the above, but for DENSE/clustered low spectra (the real m=0.01 SDM
+case) it is fragile vs shift-invert. So: **shift-invert = per-ENSEMBLE eigensolve; Cheby+RR = cheap
+per-CONFIG path** (read the ensemble eigref + mild margins).
+
+UPDATE (2026-06-26): chunk B (source-projection) DONE + validated. Refactored shared machinery into
+`examples/disc_lma_v2_common_claude.h`; built `examples/disc_lma_estimator_bench_v2_claude.cc` (exact
+$L^\text{low}$ + plain full-solve loop + PROJECTED high solve + NSRC variance). DET GATE
+$\|S_\text{full}-(S_\text{high}+S_\text{low})\|/\|S_\text{full}\|=1.6e-8$ => the projection LMA is
+UNBIASED to solver tol for ANY modes (the $u_i=M_{pc}v_i/\sigma_i$ construction makes the split cancel
+term-by-term; eigensolve is MIXED-prec single-Lanczos->double-RR/A2A/solve; RR is redundant for
+correctness, only buys variance). 4^4 HOT variance ratio>1 (EXPECTED: gapped, no near-zero modes --
+LMA needs the light/near-zero regime).
+
+CHUNK D DONE (2026-06-26): `disc_multipleGamma_binary_lma_claude.cc` written + COMPILES (never edit the
+original disc binary). Config loop + self-skip + wall-blocker + per-config mixed-prec Cheby+RR (reading
+the per-ensemble eigref) + EVEC CHECKPOINT (`evec.<conf>.scidac`/`eval.<conf>.h5`, reload to skip the
+eigensolve on rerun) + LMA loop (exact $L^\text{low}$ + `SolvePropProjected` high) -> `traces.<gam>.<conf>`
+Scidac (drop-in; pipeline unchanged). RNG4 = `SeedUniqueString(config_path)`. NOT YET RUN in production --
+needs a real config dir + a per-ensemble eigref (RUN recipe in `disc_lma_production_impl_plan_claude.md`:
+eigref once on a real config (no --hot), then the binary). PENDING physics: run on a real near-zero-mode
+ensemble to measure the actual variance ratio (<1 expected there). Full state: machine memory
+`project_disc_lma_cheby_v2_state.md`.
+
+### RELEVANT FILES for the remote agent (all in `examples/` of this fork, all `_claude`)
+- **`disc_lma_v2_common_claude.h`** -- READ FIRST. Shared machinery (header-only, inline): `BuildLowModes`
+  (eigensolve Cheby/shift-invert, single/double, + RR -> refined subspace), `BuildA2ASet` (-> per-mode
+  `a_i,b_i,u_i,sigma_i`), `BuildPhysicalA2A` (the v/w lift), `ComputeChebWindow` (auto window + auto order
+  from `CHEB_GAIN`), `RayleighRitzRefine`, `SetupGauge`, `ReadEigref`, `LMAEigParams`/`ReadLMAEigParams`.
+- **`disc_lma_eigref_v2_claude.cc`** -- per-ENSEMBLE shift-invert eigref pre-calc -> `eigref_<grid>_m<mass>.h5`
+  (HDF5 landscape: `lambda`, `sigma`, `lambda_max`). Run ONCE per ensemble.
+- **`disc_lma_bench_v2_claude.cc`** -- eigensolve VALIDATION bench (thin; `#include`s the header): GATES 1-3
+  + exact `L^low`. Use to sanity-check the eigenbasis on a new ensemble.
+- **`disc_lma_estimator_bench_v2_claude.cc`** -- the LMA ESTIMATOR validation bench (chunk B/C): plain
+  full-solve loop + `SolveHighProjected` + exact `L^low` + the DET GATE + `NSRC` variance loop.
+- **`disc_multipleGamma_binary_lma_claude.cc`** -- the PRODUCTION binary (chunk D): config loop +
+  self-skip + wall-blocker + per-config Cheby+RR (eigref) + EVEC checkpoint (`SaveEvecs`/`LoadEvecs`) +
+  the projected-LMA loop -> `traces.<gam>.<conf>` Scidac (drop-in). Run recipe in
+  `disc_lma_production_impl_plan_claude.md`. NEVER edit the original `disc_multipleGamma_binary_claude.cc`.
+- `disc_lma_cheby_v2_impl_plan_claude.md` -- eigensolve design + every Grid bug/lesson (degree parity,
+  auto-order, AccCache, degeneracy nan, getopt).
+- `disc_lma_estimator_bench_impl_plan_claude.md` -- estimator design: projection vs recombination,
+  unbiasedness derivation, mode-accuracy/mixed-precision.
+- `disc_lma_production_impl_plan_claude.md` -- chunk-D production design + DECISIONS (RNG, output,
+  evec checkpoint) + the RUN recipe (eigref once per ensemble, then the production binary).
+- Build/run: repo-root **`tmp_claude.sh`** (`REGEN=1` only when Make.inc changes; phases: eigref ->
+  eigensolve bench -> estimator bench; 4^4 HOT testbed). `examples/Make.inc` registers the binaries.
+
+---
+
 Pick-up doc for continuing the disconnected-loop **low-mode averaging (LMA)** work and
 the **eigensolve** investigation in a local environment. All paths below are in the
 `nobuyukimatsumoto68/Grid` fork unless noted; the disc/LMA code lives in `examples/`.
