@@ -317,6 +317,8 @@ struct LMAEigParams {
   int    eig_method, eig_prec, rr_refine;
   int    cheb_lo_auto; double cheb_lo_fac, cheb_lo_man, cheb_gain, cheb_atop, cheb_hifc;
   int    cheb_o;
+  // mixed-prec BATCHED projected-solve knobs (v2 fast path; SolvePropProjectedMixedBatched)
+  double inner_tol; int maxinner, maxouter, maxpatch;
 };
 
 inline LMAEigParams ReadLMAEigParams()
@@ -344,6 +346,12 @@ inline LMAEigParams ReadLMAEigParams()
   P.cheb_hifc = env_double("CHEB_HI_FAC",1.1);
   P.eig_prec  = env_int   ("EIG_PREC",   1);     // 1 = single, 2 = double
   P.rr_refine = env_int   ("RR_REFINE",  1);
+  // mixed-prec batched projected-solve (v2): outer tol stays 1e-8 (hardwired); INNER_TOL is the
+  // single-prec inner-CG rel tol (1e-8 forces ~3 full outer iters -> 1e-4 unlocks the speedup).
+  P.inner_tol = env_double("INNER_TOL", 1.0e-4);
+  P.maxinner  = env_int   ("MAXINNER",  10000);
+  P.maxouter  = env_int   ("MAXOUTER",  50);
+  P.maxpatch  = env_int   ("MAXPATCH",  1000);
   return P;
 }
 
@@ -457,6 +465,9 @@ inline void BuildLowModes(MobiusFermionD &D, MobiusFermionF &D_f,
 
   // Extract the Nuse subspace in DOUBLE (emplace_back; do NOT free the store -- see the
   // AccCache.bytes==bytes lesson), then optional Rayleigh-Ritz polish to double accuracy.
+  // NOTE: an A/B test (2026-06-26) swapped this to Grid's native std::vector<Field>(Nuse, grid)
+  // initializer -- NEV=123 crashed IDENTICALLY (same CpuPtr!=NULL eviction assert, same spot), so the
+  // core dump is a pure device-memory threshold, INDEPENDENT of construction pattern. Reverted.
   const int Nuse = std::min(P.Nev, Nconv);
   sub.clear();
   sub.reserve(Nuse);
@@ -634,6 +645,77 @@ inline void SolvePropProjected(MobiusFermionD &D,
       SolveHighProjected(D, HermOpEO, u, src4, res4);
       FermToProp<MobiusFermionD>(propagator, res4, s, col);
     }
+  }
+}
+
+// ---- v2 FAST projected high solve: MIXED-PRECISION + BATCHED over the 16 spin-colour columns.
+// Same math as SolvePropProjected (project the low modes out -> well-conditioned high solve, outer
+// tol 1e-8) but the per-column double CG is replaced by ONE MixedPrecisionConjugateGradientBatched
+// (single inner / double reliable-update, arXiv:0911.3191; batched mRHS, arXiv:0707.0131) over all
+// 16 odd-cb projected sources. The eo-Schur reduction + projection + reconstruction are done per
+// column (the vector RedBlackSource overloads are name-hidden -> single-field prep), the SOLVE is
+// batched. Bit-for-bit the same estimator (1e-8) as SolvePropProjected -> traces are interchangeable.
+inline void SolvePropProjectedMixedBatched(
+    MobiusFermionD &D, MobiusFermionF &D_f,
+    SchurDiagMooeeOperator<MobiusFermionD,LatticeFermion>  &HermOpEO,
+    SchurDiagMooeeOperator<MobiusFermionF,LatticeFermionF> &HermOpEO_f,
+    const std::vector<LatticeFermion> &u,
+    LatticePropagator &source, LatticePropagator &propagator,
+    double inner_tol, int maxinner, int maxouter, int maxpatch)
+{
+  GridBase *UGrid     = D.GaugeGrid();
+  GridBase *FGrid     = D.FermionGrid();
+  GridBase *FrbGrid   = D.FermionRedBlackGrid();
+  GridBase *FrbGrid_f = D_f.FermionRedBlackGrid();
+  const int N = Nd*Nc;   // 16 spin-colour columns
+
+  std::vector<LatticeFermion> src_tilde(N, FrbGrid);   // projected odd-cb sources (RHS)
+  std::vector<LatticeFermion> src_e_v  (N, FrbGrid);   // even-cb source kept for reconstruction
+  std::vector<LatticeFermion> sol_o    (N, FrbGrid);   // odd-cb solutions
+
+  // ---- per-column: import + Schur-reduce + project low modes out + Mpc^dag ----
+  for(int sc=0; sc<N; sc++){
+    const int s = sc / Nc, col = sc % Nc;
+    LatticeFermion eta4(UGrid), src5(FGrid);
+    PropToFerm<MobiusFermionD>(eta4, source, s, col);
+    D.ImportPhysicalFermionSource(eta4, src5);
+
+    LatticeFermion src_e(FrbGrid), src_o(FrbGrid);
+    pickCheckerboard(Even, src_e, src5);
+    pickCheckerboard(Odd , src_o, src5);
+    src_e_v[sc] = src_e;
+
+    LatticeFermion tmp_e(FrbGrid), Mtmp(FrbGrid), bo(FrbGrid);
+    D.MooeeInv(src_e, tmp_e);
+    D.Meooe(tmp_e, Mtmp);
+    bo = src_o - Mtmp;
+    for(int i=0; i<(int)u.size(); i++){
+      ComplexD ci = innerProduct(u[i], bo);
+      bo = bo - ci * u[i];
+    }
+    HermOpEO.MpcDag(bo, src_tilde[sc]);
+    sol_o[sc] = Zero();
+    sol_o[sc].Checkerboard() = Odd;
+  }
+
+  // ---- the batched mixed-precision solve (the speedup): outer tol 1e-8 NEVER relaxed ----
+  MixedPrecisionConjugateGradientBatched<LatticeFermion,LatticeFermionF>
+    bCG(1.0e-8, maxinner, maxouter, maxpatch, FrbGrid_f, HermOpEO_f, HermOpEO);
+  bCG.InnerTolerance = inner_tol;
+  bCG(src_tilde, sol_o);
+
+  // ---- per-column: reconstruct full 5D + export the physical 4D high solution ----
+  for(int sc=0; sc<N; sc++){
+    const int s = sc / Nc, col = sc % Nc;
+    LatticeFermion te(FrbGrid), sol_e(FrbGrid), sol5(FGrid), out4(UGrid);
+    D.Meooe(sol_o[sc], te);
+    te = src_e_v[sc] - te;
+    D.MooeeInv(te, sol_e);
+    sol5 = Zero();
+    setCheckerboard(sol5, sol_e);
+    setCheckerboard(sol5, sol_o[sc]);
+    D.ExportPhysicalFermionSolution(sol5, out4);
+    FermToProp<MobiusFermionD>(propagator, out4, s, col);
   }
 }
 

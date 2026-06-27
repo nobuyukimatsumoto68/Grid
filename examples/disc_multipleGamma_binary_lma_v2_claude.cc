@@ -4,16 +4,19 @@
 #include <ctime>    // wall-time blocker
 #include <cstdlib>  // getenv/atol for the blocker
 
-// disc LMA PRODUCTION binary (chunk D). Config-loop disconnected-loop measurement with LMA:
-// per config -> mixed-prec Cheby+RR eigensolve (reading the per-ENSEMBLE eigref) -> physical A2A
-// -> the LMA loop = exact noise-free L^low + source-PROJECTED stochastic high part, written in the
-// SAME Scidac format `traces.<gam>.<conf>` as disc_multipleGamma_binary_claude.cc (drop-in; the
-// downstream pipeline is unchanged). Shared machinery: disc_lma_v2_common_claude.h. Validated
-// prototype: disc_lma_estimator_bench_v2_claude.cc. Never edit the original disc binary.
+// disc LMA PRODUCTION binary -- v2 (FASTER projected solve). Identical to
+// disc_multipleGamma_binary_lma_claude.cc EXCEPT the per-config stochastic high part uses the
+// MIXED-PRECISION BATCHED projected solve (SolvePropProjectedMixedBatched): single-inner/double-
+// reliable-update CG (arXiv:0911.3191) batched over the 16 spin-colour columns (arXiv:0707.0131),
+// instead of 16 plain double CGs. Outer tol 1e-8 unchanged -> bit-compatible traces.<gam>.<conf>
+// (drop-in). Expected ~1.4-2x over the v1 projected solve (#1 mixed-prec + #2 batching), on top of
+// the ~4x deflation-by-projection already in v1. Per config -> Cheby+RR eigensolve (eigref) ->
+// physical A2A -> exact noise-free L^low + the mixed-batched projected high -> Scidac traces.
+// Shared machinery: disc_lma_v2_common_claude.h. Never edit the original disc binary.
 //
-// Decisions (disc_lma_production_impl_plan_claude.md): RNG4 = SeedUniqueString(config_path) per
-// config (config-unique, deterministic); output = combined LMA loop only; evec CHECKPOINT
-// (evec.<conf>.scidac + eval.<conf>.h5) saved after the eigensolve and reloaded on rerun to SKIP it.
+// Decisions: RNG4 = SeedUniqueString(config_path) per config; output = combined LMA loop only;
+// NO evec checkpoint (evecs stay in memory). Knobs: INNER_TOL/MAXINNER/MAXOUTER/MAXPATCH (mixed CG)
+// + the eigensolve env (ReadLMAEigParams).
 //
 // LMA: DeGrand-Schaefer hep-lat/0401011; Giusti et al hep-lat/0402002. A2A: Foley et al hep-lat/0505023.
 
@@ -88,7 +91,7 @@ int main(int argc, char** argv)
 
   const int Nt = UGrid->_fdimensions[Tdir];
 
-  std::cout << GridLogMessage << "# disc LMA production: mass=" << mass << " beta=" << beta
+  std::cout << GridLogMessage << "# disc LMA production v2 (mixed-batched): mass=" << mass << " beta=" << beta
             << " Nt=" << Nt << " dir=" << dir << " obsdir=" << obsdir
             << " eigref=" << eigref << std::endl;
 
@@ -203,22 +206,34 @@ int main(int argc, char** argv)
     std::cout << GridLogMessage << "# conf " << conf << " eigensolved " << sub.size()
               << " modes (in memory, no checkpoint)" << std::endl;
 
-    std::vector<LatticeFermion> a, b4v, u;
-    std::vector<RealD>          sigma;
-    BuildA2ASet(D, HermOpEO, sub, eval_use, a, b4v, u, sigma);
+    // Per-mode physical A2A, STREAMED to bound peak device memory. The exact-low part L^low
+    // consumes each (a_i,b_i) only transiently (one inner-product accumulation), but the
+    // deflated solve needs ALL u_i across the dilution loop. So hold ALL u_i (odd-cb, ~5x
+    // cheaper than a full-4D field) and build a_i,b_i ONE pair at a time, discarding them after
+    // accumulating L^low. This drops the physical-A2A footprint from O(Nuse) full-4D fields to
+    // O(1), letting Nuse reach Nconv (the deflation-depth lever) without tripping the AccCache
+    // eviction assert that hit at high mode count when all a_i,b_i were materialized at once.
+    // Replaces the former BuildA2ASet(...) one-shot build of {a,b,u}.
     const int Nuse = (int)sub.size();
+    std::vector<LatticeFermion> u;
+    std::vector<RealD>          sigma(Nuse, 0.0);
+    u.reserve(Nuse);
+    for(int i=0; i<Nuse; i++) u.emplace_back(FrbGrid);
 
     // ---- the LMA loop field per gamma: res = exact L^low + projected high stochastic ----
     std::vector<LatticeComplex> res(ngam, LatticeComplex(UGrid));
     for(auto &r : res) r = Zero();
 
-    // exact noise-free low part: L^low_Gamma(x) = sum_i (1/sigma_i) tr_sc[Gamma a_i b_i^dag](x)
+    // exact noise-free low part: L^low_Gamma(x) = sum_i (1/sigma_i) tr_sc[Gamma a_i b_i^dag](x),
+    // streaming a_i,b_i (full 4D) one mode at a time; u_i (odd-cb) is retained for the solve.
     {
-      LatticeFermion Ga(UGrid);
+      LatticeFermion a_i(UGrid), b_i(UGrid), Ga(UGrid);
       for(int i=0; i<Nuse; i++){
+        sigma[i] = std::sqrt(eval_use[i]);
+        BuildPhysicalA2A(D, HermOpEO, sub[i], sigma[i], a_i, b_i, u[i]);
         for(int ig=0; ig<ngam; ig++){
-          Ga = Gamma(gams[ig]) * a[i];
-          res[ig] = res[ig] + (1.0/sigma[i]) * localInnerProduct(b4v[i], Ga);
+          Ga = Gamma(gams[ig]) * a_i;
+          res[ig] = res[ig] + (1.0/sigma[i]) * localInnerProduct(b_i, Ga);
         }
       }
     }
@@ -232,7 +247,8 @@ int main(int argc, char** argv)
         StochasticDilutedSource(RNG4, source, UrbGrid, t, eo);
 
         LatticePropagator StochPropHigh(UGrid);
-        SolvePropProjected(D, HermOpEO, u, source, StochPropHigh);
+        SolvePropProjectedMixedBatched(D, D_f, HermOpEO, HermOpEO_f, u, source, StochPropHigh,
+                                       P.inner_tol, P.maxinner, P.maxouter, P.maxpatch);
 
         LatticeComplex tr(UGrid);
         for(int ig=0; ig<ngam; ig++){
