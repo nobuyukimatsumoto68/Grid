@@ -143,6 +143,13 @@ int main(int argc, char** argv)
     conf_min = confs.front();
     interval = (confs.size() >= 2) ? confs[1] - confs[0] : 1;
     conf_max = confs.back() + interval;
+    // env overrides for the MEASUREMENT set: the new light ensembles are RAW HMC histories
+    // (stride-4 from a COLD lat.4, plaq ~0.39 vs thermalized ~0.56) -- looping all of them both
+    // hangs the eigensolve on the cold config and is far too many. CONF_MIN skips thermalization,
+    // CONF_STRIDE picks the decorrelated subset (match the conn-meson set), CONF_MAX caps the range.
+    if(const char* e = std::getenv("CONF_MIN"))     conf_min = std::atoi(e);
+    if(const char* e = std::getenv("CONF_MAX"))     conf_max = std::atoi(e);
+    if(const char* e = std::getenv("CONF_STRIDE")){ int s = std::atoi(e); if(s > 0) interval = s; }
   }
   std::cout << GridLogMessage << "# conf_min=" << conf_min << " conf_max=" << conf_max
             << " interval=" << interval << std::endl;
