@@ -23,15 +23,15 @@ config. Idea: R. Brower + T. Izubuchi. Mobius/Cayley: Brower-Neff-Orginos arXiv:
 ├── Grid/                                       # the Grid fork (branch dwf_prec)
 │   ├── Grid/
 │   │   ├── perfmon/PerfCount.h                 # [EDITED, 2 lines] CUDA build fix
-│   │   ├── qcd/utils/FreeMobius5D_claude.h     # [NEW, 378 L] the preconditioner (kernel + F + M0)
-│   │   └── tests/solver/Test_dwf_freeprec_claude.cc  # [NEW, 282 L] validation ladder + benchmark harness
+│   │   ├── qcd/utils/FreeMobius5D_claude.h     # [NEW, 364 L] the preconditioner (kernel + F + M0)
+│   │   └── tests/solver/Test_dwf_freeprec_claude.cc  # [NEW, 481 L] validation ladder + 3b cross-check + headline
 │   └── scripts_nm/                             # scripts + this handoff (git-traced in the fork; CANONICAL)
 │       ├── grid_freeprec_build_claude.sh       # [NEW] standalone build+run handoff (no reconfigure)
 │       ├── build_grid_ubuntu.sh                # Grid configure/build (CUDA)
 │       └── grid_freeprec_handoff_peter_claude.md  # THIS document
 ├── grid_freeprec_build_claude.log              # [generated] compile + run output (written to dwms/)
 └── dwf4_qcd_claude/
-    └── grid_dwf_prec_impl_plan_claude.md       # [NEW, 182 L] design/impl plan + status + derivations
+    └── grid_dwf_prec_impl_plan_claude.md       # [NEW, 208 L] design/impl plan + status + derivations
 ```
 
 ## Per-file detail
@@ -51,7 +51,9 @@ Header-only, `namespace Grid`. Three pieces:
   parametrized by $(M5,L_s,m)$ only (no $b,c$), so it is wrong for generic Mobius (even $b=c=1$).
 - `FreeMobius5DInverse<Impl>` — the apply $F$. **Reuses Grid's `FreePropagator` FFT+twist verbatim**;
   the ONLY substitution is the momentum-space step (Grid's Shamir analytic propagator -> our
-  per-momentum block solve, precomputed inverse, colour-blind). `LinearFunction<FermionField>`.
+  per-momentum block solve, precomputed inverse, colour-blind). The momentum-space gather/scatter uses a
+  bulk host<->device transfer per apply (`unvectorize/vectorizeFromLexOrdArray`), NOT per-site peek/poke
+  (which is a device-sync storm at $8^4$). `LinearFunction<FermionField>`.
 - `FreeLimitPreconditioner<Impl>` — $M_0(x)=\Omega^\dagger F(\Omega x)$; $\Omega=$ gauge-fixer `xform`
   broadcast across the $L_s$ slices. Also `LinearFunction`. `n_apply` counter (= FGMRES outer iters).
 
@@ -61,8 +63,10 @@ Header-only, `namespace Grid`. Three pieces:
 - gate 1: cold gate on unit gauge vs Grid's actual `MobiusFermionD`, both directions
   $\lVert FDv-v\rVert$ and $\lVert DFv-v\rVert$.
 - gate 2: pure-gauge gate — $U^g=g_0\mathbb1 g_0^\dagger$, Landau-fix, $\lVert M_0 D[U^g]v-v\rVert$.
-- chunk-3 harness: WilsonFlow frame + FGMRES($M_0$) vs CGNE $D_W$-apply count (currently on a Hot
-  config as a plumbing check; headline needs a thermalized config).
+- chunk 3 harness (`run_headline`): WilsonFlow frame + FGMRES($M_0$) vs CGNE $D_W$-apply count.
+- chunk 3b (`nersc_crosscheck`, `--config`): load a NERSC config (plaquette/checksum check), bit-exact
+  raw $D_W(-M5)$ cross-check via threaded spectral moments (4^4; auto-skipped for $V_4>256$), then the
+  headline on the loaded config. Runs at 4^4 or 8^4 (gate 2 + hot auto-skipped for `--config`).
 
 ### `Grid/scripts_nm/grid_freeprec_build_claude.sh` — NEW (build/run handoff, CANONICAL)
 Compiles the ONE test standalone against the already-built `build/Grid/libGrid.a` via `grid-config`
@@ -76,27 +80,37 @@ Physics/goal, Grid facilities used, the "reuse Grid's Fourier; only the eigenval
 the eigenvalue-vs-eigenvector derivation (Shamir->Mobius changes both), ordered chunks, per-chunk
 validation status, open questions.
 
-## Validation status (all PASS on $4^4$, $L_s8$, $M5=1.8$, headline Shamir $b{=}1.5,c{=}0.5$)
+## Validation status ($L_s8$, $M5=1.8$, Shamir $b{=}1.5,c{=}0.5$, $m0.1$)
 
 | gate | quantity | result |
 |---|---|---|
-| 0a | free $D_W(p)$ eigenvalues vs $d\pm i\sqrt S$ | 5e-16 |
-| 0b | free Mobius block min/max $|\lambda|$ vs table | 3e-6 (table-precision limited) |
-| 1  | cold gate $\lVert FDv-v\rVert$ / $\lVert DFv-v\rVert$ (vs Grid `MobiusFermionD`) | 3.7e-16 both |
-| 2  | pure-gauge $\lVert M_0 D[U^g]v-v\rVert$ (Landau functional 1.2e-12, $Q\approx0$) | 5.9e-12 |
+| 0a | free $D_W(p)$ eigenvalues vs $d\pm i\sqrt S$ (4^4) | 5e-16 |
+| 0b | free Mobius block min/max $|\lambda|$ vs table, all $(b,c,m)$ (4^4) | 3e-6 (table-precision limited) |
+| 1  | cold gate $\lVert FDv-v\rVert$ / $\lVert DFv-v\rVert$ vs Grid `MobiusFermionD` | 3.7e-16 (4^4), 5.6e-16 (8^4) |
+| 2  | pure-gauge $\lVert M_0 D[U^g]v-v\rVert$ (4^4; skipped for `--config`) | 5.9e-12 |
 | 3b | raw $D_W(-M5)$ cross-check vs dwf4 (spectral moments $\mathrm{tr}D_W^k$, $k{=}1..6$) on NERSC $4^4\,\beta6$ | 5e-14 rel |
 
-Chunk 3b also loads the NERSC config clean (plaquette match 4e-11 vs header 0.6093762125, checksum
-a9d6b482) and runs the headline: **CGNE 141 it / 2256 $D_W$ vs FGMRES($M_0$) 76 it / 608 $D_W$ = 3.71x**.
+**Headline (the win).** On the shared NERSC SU(3) $\beta6\,m0.1$ configs (plaquette + checksum verified at
+load), $M_0$-preconditioned no-restart FGMRES vs CGNE, counting $D_W$ applies (CGNE $2L_s$/iter, FGMRES
+$L_s$/iter, $M_0$ costs 0 $D_W$):
 
-**KNOWN ISSUE (being fixed):** the $M_0$ frame's gauge fixer (Grid `FourierAcceleratedGaugeFixer`,
-$\alpha{=}0.1$) *converges then diverges* on the flowed $\beta6$ config -- dmuAmu $12759\to254$ (it20)
-$\to$ ~28000 (stuck). The frame used is the diverged one (flowed-fixed Landau functional 0.128), which
-caps the win at 3.71x vs the dwf4 reference ~10x. Fix in progress: lower $\alpha$ / stop at the
-converged iterate. The bit-exact operator gate (3b) is unaffected and passes.
+| volume | CGNE | FGMRES($M_0$) | speedup | flowed-fixed Landau functional |
+|---|---|---|---|---|
+| $4^4$ | 141 it / 2256 $D_W$ | 67 it / 536 $D_W$ | **4.21x** | 0.089 |
+| $8^4$ | 422 it / 6752 $D_W$ | 79 it / 632 $D_W$ | **10.68x** | 0.021 |
 
-Pending: converge the frame (recover ~10x); then the $8^4$ Arnoldi bundle (extremal $D_W$ + lowest
-$H_W(-M5)$ + CGNE count); then the R2 topology scan at $16^4+$ (correlate the win with $Q$).
+The $8^4$ 10.68x matches the dwf4 reference (F1 no-restart 10.33x). The win grows with volume, tracked by
+the flowed-fixed Landau functional (lower functional = better frame = bigger win).
+
+**Frame note (resolved gotcha).** The gauge-fix step uses $\alpha=0.1/16$: Grid's
+`FourierAccelSteepestDescentStep` weights the force by `psqMax/psq` with `psqMax=16` (`GaugeFix.h:198`),
+a 16x-larger step than the dwf4 reference `1/psq`, so $\alpha=0.1$ overshoots and diverges -- $\alpha/16$
+reproduces the stable step (Davies et al. PRD 37 (1988) 1581). maxiter 1000 (softer modes at larger $L$
+need more iters; watch the dmuAmu plateau).
+
+Pending: the R2 topology scan at $16^4+$ -- correlate the win with the flowed-clover charge $Q$ (is the
+free-prec a trivial-sector method? flow preserves $Q$, so a $Q\neq0$ config should obstruct the frame),
+awaiting a Q=0 / Q!=0 config pair. Optional: $8^4$ $m{=}0.02$ light-mass trend.
 
 ## Build / run
 
@@ -104,6 +118,9 @@ $H_W(-M5)$ + CGNE count); then the R2 topology scan at $16^4+$ (correlate the wi
 bash /mnt/baracuda_14/dwms/Grid/scripts_nm/grid_freeprec_build_claude.sh   # reads build/grid-config; no reconfigure
 # results in /mnt/baracuda_14/dwms/grid_freeprec_build_claude.log
 ```
-Prereq: `libGrid.a` built (done) and `make install` populated `build/include`+`build/lib` (the script
-runs it). To wire the test into Grid's own `make`: `./scripts/filelist` (or `./bootstrap.sh`) picks up
-`tests/solver/Test_*.cc`, then reconfigure.
+The script runs `make install` ONCE to populate `build/include`+`build/lib` for `grid-config`, then
+skips it on later runs (it is guarded by an existence check), so a normal iteration just recompiles the
+one test (the test `.cc` and the header-only `FreeMobius5D_claude.h` are not part of `libGrid.a`). It runs
+the 8^4 headline by default; edit the `GRID`/`CFG` variables in the `[4/4]` block for 4^4 or another
+config. To instead wire the test into Grid's own `make`: `./scripts/filelist` (or `./bootstrap.sh`) picks
+up `tests/solver/Test_*.cc`, then reconfigure.
