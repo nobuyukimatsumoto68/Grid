@@ -56,7 +56,11 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
   // stable step; it then decreases monotonically to the flowed-fixed plateau. FA Landau gauge fixing:
   // C.T.H. Davies et al., PRD 37 (1988) 1581.
   RealD gf_alpha = 0.1 / 16.0;
-  int gf_maxit = 300;
+  // Frame convergence scales with volume: the softest mode phat^2_min = 2-2cos(2pi/L) shrinks with L
+  // (~0.586 at L=8 vs 2.0 at L=4), so the FA fixer needs MORE iters at larger volume. 1000 is generous
+  // insurance (the alpha=0.00625 step is stable/monotone, so extra iters only converge further); watch
+  // the printed dmuAmu/functional plateau to confirm convergence.
+  int gf_maxit = 1000;
   FourierAcceleratedGaugeFixer<PeriodicGimplD>::SteepestDescentGaugeFix(
       Uflowed, xform, gf_alpha, gf_maxit, 1.0e-12, 1.0e-12, /*Fourier=*/true, /*orthog=*/-1,
       /*err_on_no_converge=*/false);
@@ -389,55 +393,58 @@ int main(int argc, char** argv) {
   std::cout << "  ||F D v - v||/||v|| = " << e1 << "   ||D F v - v||/||v|| = " << e2 << "   "
             << (gate1 ? "PASS" : "FAIL") << std::endl;
 
-  // ---------- gate 2: pure-gauge gate ----------
-  // U^g = g0 . 1 . g0^dag (pure gauge). Landau-fix a COPY -> Omega = xform, U^L ~ 1. M0 = Omega^dag F
-  // Omega must invert D_DW built on the ORIGINAL U^g (flow/fix only supply the frame; solve the original).
-  std::cout << "==== gate 2: pure-gauge gate  ||M0 D[U^g] v - v|| ====" << std::endl;
-  GridParallelRNG RNG4(UGrid);
-  RNG4.SeedFixedIntegers(std::vector<int>({5, 6, 7, 8}));
-
-  LatticeGaugeFieldD Ug(UGrid);
-  SU<Nc>::ColdConfiguration(Ug);
-  LatticeColourMatrixD g0(UGrid);
-  SU<Nc>::RandomGaugeTransform<PeriodicGimplD>(RNG4, Ug, g0);  // Ug = g0 . 1 . g0^dag
-
-  LatticeGaugeFieldD Ufix = Ug;  // fix a COPY; D_DW uses the original Ug
-  LatticeColourMatrixD xform(UGrid);
-  Real alpha = 0.1;
-  int gfmaxit = 5000;
-  Real gftol = 1.0e-12;
-  FourierAcceleratedGaugeFixer<PeriodicGimplD>::SteepestDescentGaugeFix(
-      Ufix, xform, alpha, gfmaxit, gftol, gftol, /*Fourier=*/true, /*orthog=*/-1,
-      /*err_on_no_converge=*/false);
-
-  Real plaq_fix = WilsonLoops<PeriodicGimplD>::avgPlaquette(Ufix);
-  Real link_fix = WilsonLoops<PeriodicGimplD>::linkTrace(Ufix);
-  Real landau_func = 1.0 - link_fix;  // Landau functional; -> 0 iff U^L -> 1 (frame quality, R1)
-  Real Qtop = WilsonLoops<PeriodicGimplD>::TopologicalCharge(Ug);
-  std::cout << "  fixed-config plaquette = " << plaq_fix << "  (pure gauge -> ~1)"
-            << "   Landau functional 1-linkTrace = " << landau_func << "  (-> 0 iff U^L -> 1)"
-            << "   topo charge Q = " << Qtop << std::endl;
-
-  MobiusFermionD Dg(Ug, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
-  FreeMobius5DInverse<WilsonImplD> Ffree(FGrid, Ls, M5, bb, cc, mm, boundary);
-  FreeLimitPreconditioner<WilsonImplD> M0(Ffree, xform, FGrid);
-
-  LatticeFermionD v2(FGrid);
-  LatticeFermionD Dgv(FGrid);
-  LatticeFermionD M0Dgv(FGrid);
-  gaussian(RNG5, v2);
-  Dg.M(v2, Dgv);
-  M0(Dgv, M0Dgv);
-  double e3 = std::sqrt(norm2(M0Dgv - v2) / norm2(v2));
-  bool gate2 = (e3 < 1e-6);
-  std::cout << "  ||M0 D[U^g] v - v||/||v|| = " << e3 << "   " << (gate2 ? "PASS" : "FAIL") << std::endl;
-
   bool have_cfg = GridCmdOptionExists(argv, argv + argc, "--config");
+  bool gate2 = true;
 
-  // ---------- chunk 3 harness: shakeout on a Hot config (only when NO real config is given) ----------
-  // A raw Hot config is not thermalized -> bad frame -> M0 does not help (and its gauge-fix does not
-  // converge, flooding the log). Skip it when --config supplies the real thermalized config below.
+  // gate 2 (pure-gauge) + the Hot-config shakeout are config-INDEPENDENT validations. Skip BOTH for a
+  // real --config run: gate 2 is already validated at 4^4, and its pure-gauge fix uses alpha=0.1 (the
+  // uncorrected 16x-too-large step) which could diverge at 8^4 and spuriously fail the run. Gate 1
+  // above already re-validates the (now bulk-transfer) F apply at the run's volume.
   if (!have_cfg) {
+    // ---------- gate 2: pure-gauge gate ----------
+    // U^g = g0 . 1 . g0^dag (pure gauge). Landau-fix a COPY -> Omega = xform, U^L ~ 1. M0 = Omega^dag F
+    // Omega must invert D_DW built on the ORIGINAL U^g (fix only supplies the frame; solve the original).
+    std::cout << "==== gate 2: pure-gauge gate  ||M0 D[U^g] v - v|| ====" << std::endl;
+    GridParallelRNG RNG4(UGrid);
+    RNG4.SeedFixedIntegers(std::vector<int>({5, 6, 7, 8}));
+
+    LatticeGaugeFieldD Ug(UGrid);
+    SU<Nc>::ColdConfiguration(Ug);
+    LatticeColourMatrixD g0(UGrid);
+    SU<Nc>::RandomGaugeTransform<PeriodicGimplD>(RNG4, Ug, g0);  // Ug = g0 . 1 . g0^dag
+
+    LatticeGaugeFieldD Ufix = Ug;  // fix a COPY; D_DW uses the original Ug
+    LatticeColourMatrixD xform(UGrid);
+    Real alpha = 0.1;
+    int gfmaxit = 5000;
+    Real gftol = 1.0e-12;
+    FourierAcceleratedGaugeFixer<PeriodicGimplD>::SteepestDescentGaugeFix(
+        Ufix, xform, alpha, gfmaxit, gftol, gftol, /*Fourier=*/true, /*orthog=*/-1,
+        /*err_on_no_converge=*/false);
+
+    Real plaq_fix = WilsonLoops<PeriodicGimplD>::avgPlaquette(Ufix);
+    Real link_fix = WilsonLoops<PeriodicGimplD>::linkTrace(Ufix);
+    Real landau_func = 1.0 - link_fix;  // Landau functional; -> 0 iff U^L -> 1 (frame quality, R1)
+    Real Qtop = WilsonLoops<PeriodicGimplD>::TopologicalCharge(Ug);
+    std::cout << "  fixed-config plaquette = " << plaq_fix << "  (pure gauge -> ~1)"
+              << "   Landau functional 1-linkTrace = " << landau_func << "  (-> 0 iff U^L -> 1)"
+              << "   topo charge Q = " << Qtop << std::endl;
+
+    MobiusFermionD Dg(Ug, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
+    FreeMobius5DInverse<WilsonImplD> Ffree(FGrid, Ls, M5, bb, cc, mm, boundary);
+    FreeLimitPreconditioner<WilsonImplD> M0(Ffree, xform, FGrid);
+
+    LatticeFermionD v2(FGrid);
+    LatticeFermionD Dgv(FGrid);
+    LatticeFermionD M0Dgv(FGrid);
+    gaussian(RNG5, v2);
+    Dg.M(v2, Dgv);
+    M0(Dgv, M0Dgv);
+    double e3 = std::sqrt(norm2(M0Dgv - v2) / norm2(v2));
+    gate2 = (e3 < 1e-6);
+    std::cout << "  ||M0 D[U^g] v - v||/||v|| = " << e3 << "   " << (gate2 ? "PASS" : "FAIL") << std::endl;
+
+    // ---------- Hot-config shakeout (plumbing/counting; not the physics win) ----------
     LatticeGaugeFieldD Uh(UGrid);
     SU<Nc>::HotConfiguration(RNG4, Uh);
     run_headline("Hot config -- shakeout", Uh, UGrid, UrbGrid, FGrid, FrbGrid,

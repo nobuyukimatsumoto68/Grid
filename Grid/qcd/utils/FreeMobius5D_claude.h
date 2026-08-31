@@ -285,59 +285,45 @@ public:
     out = out * exp(ci * ph);
   }
 
-  // per-momentum dense block solve (colour-blind), Minv precomputed
+  // per-momentum dense block solve (colour-blind), Minv precomputed. Gather/scatter the whole 5D field
+  // via BULK host<->device transfers (unvectorize/vectorizeFromLexOrdArray) -- one pair per apply, NOT a
+  // peekSite/pokeSite per (site,s) (which is ~V4*Ls*2 device syncs/apply, e.g. ~65k at 8^4 -> ~4.6M over
+  // an FGMRES solve: a peekSite storm). The 5D lex index has s FASTEST: i5 = s + Ls*idx4, with idx4 the
+  // 4D lex index (x fastest) that also keys Minv -- matches Grid's IndexFromCoor for the [Ls,Lx,Ly,Lz,Lt]
+  // grid (dim 0 = s). Validated by the cold gate staying at machine eps.
   void MomentumSpaceSolve(FermionField& prop_k, const FermionField& in_k) const {
-    int L[4] = {ldim[1], ldim[2], ldim[3], ldim[4]};
     int n5 = 4 * Ls;
-    prop_k = Zero();
-    for (int kt = 0; kt < L[3]; ++kt) {
-      for (int kz = 0; kz < L[2]; ++kz) {
-        for (int ky = 0; ky < L[1]; ++ky) {
-          for (int kx = 0; kx < L[0]; ++kx) {
-            int idx = ((kt * L[2] + kz) * L[1] + ky) * L[0] + kx;
-            const Eigen::MatrixXcd& Mi = Minv[idx];
-
-            Eigen::MatrixXcd Fin(n5, Nc);
-            for (int s = 0; s < Ls; ++s) {
-              Coordinate c5(5);
-              c5[0] = s;
-              c5[1] = kx;
-              c5[2] = ky;
-              c5[3] = kz;
-              c5[4] = kt;
-              SiteSpinor v;
-              peekSite(v, in_k, c5);
-              for (int a = 0; a < 4; ++a) {
-                for (int col = 0; col < Nc; ++col) {
-                  ComplexD z = v()(a)(col);  // Grid Complex (thrust under CUDA) -> std::complex explicit
-                  Fin(s * 4 + a, col) = std::complex<double>(z.real(), z.imag());
-                }
-              }
-            }
-
-            Eigen::MatrixXcd Y = Mi * Fin;
-
-            for (int s = 0; s < Ls; ++s) {
-              Coordinate c5(5);
-              c5[0] = s;
-              c5[1] = kx;
-              c5[2] = ky;
-              c5[3] = kz;
-              c5[4] = kt;
-              SiteSpinor w;
-              w = Zero();
-              for (int a = 0; a < 4; ++a) {
-                for (int col = 0; col < Nc; ++col) {
-                  std::complex<double> y = Y(s * 4 + a, col);  // std::complex -> Grid Complex explicit
-                  w()(a)(col) = ComplexD(y.real(), y.imag());
-                }
-              }
-              pokeSite(w, prop_k, c5);
-            }
+    int V5 = Ls * V4;
+    std::vector<SiteSpinor> in_h(V5);
+    std::vector<SiteSpinor> out_h(V5);
+    unvectorizeToLexOrdArray(in_h, in_k);
+    for (int idx4 = 0; idx4 < V4; ++idx4) {
+      const Eigen::MatrixXcd& Mi = Minv[idx4];
+      Eigen::MatrixXcd Fin(n5, Nc);
+      for (int s = 0; s < Ls; ++s) {
+        int i5 = s + Ls * idx4;
+        for (int a = 0; a < 4; ++a) {
+          for (int col = 0; col < Nc; ++col) {
+            ComplexD z = in_h[i5]()(a)(col);
+            Fin(s * 4 + a, col) = std::complex<double>(z.real(), z.imag());
           }
         }
       }
+      Eigen::MatrixXcd Y = Mi * Fin;
+      for (int s = 0; s < Ls; ++s) {
+        int i5 = s + Ls * idx4;
+        SiteSpinor w;
+        w = Zero();
+        for (int a = 0; a < 4; ++a) {
+          for (int col = 0; col < Nc; ++col) {
+            std::complex<double> y = Y(s * 4 + a, col);
+            w()(a)(col) = ComplexD(y.real(), y.imag());
+          }
+        }
+        out_h[i5] = w;
+      }
     }
+    vectorizeFromLexOrdArray(out_h, prop_k);
   }
 };
 

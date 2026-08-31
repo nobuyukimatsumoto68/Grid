@@ -3,6 +3,14 @@
 Branch: `dwf_prec` (fork `git@github.com:nobuyukimatsumoto68/Grid.git`).
 Local Grid checkout: `/mnt/baracuda_14/dwms/Grid`; build dir: `/mnt/baracuda_14/dwms/build`.
 
+**Repo layout (nested git).** `/mnt/baracuda_14/dwms` is an OUTER git repo (the research working dir);
+the Grid fork at `/mnt/baracuda_14/dwms/Grid` is a SEPARATE, nested git repo (this branch). Everything
+in this document lives inside the Grid fork and is tracked by IT (commit/push from `.../dwms/Grid`) --
+including `scripts_nm/` (build scripts + this handoff), which is why they were moved inside the fork.
+Files under `dwms/` but OUTSIDE `dwms/Grid/` (e.g. the generated `.log`, the dwf4-side impl plan and the
+NERSC config bundle in `dwf4_qcd_claude/`) belong to the outer repo, not the fork, and are NOT part of
+what you would push to the Grid remote.
+
 **What this is:** a free-limit domain-wall preconditioner $M_0=\Omega^\dagger F\,\Omega$ for a flexible
 outer solver (FGMRES), where $F=D_{DW}^{\rm free}(m)^{-1}$ is the free Mobius inverse (FFT-diagonal,
 colour-blind) and $\Omega$ is a site-local SU($N$) gauge frame from Landau-fixing the Wilson-flowed

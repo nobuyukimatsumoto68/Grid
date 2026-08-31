@@ -71,9 +71,12 @@ export OMP_NUM_THREADS=8
     exit ${rc}
   fi
 
-  echo "======== [4/4] RUN (gates 0-2 + hot shakeout + chunk-3b NERSC cross-check/headline) ========"
-  CFG=/mnt/baracuda_14/dwms/dwf4_qcd_claude/cfg_su3_4444_b6.0_claude.nersc
-  ${BIN} --grid 4.4.4.4 --mpi 1.1.1.1 --config ${CFG}
+  echo "======== [4/4] RUN (gate 0 + gate 1 cold gate + chunk-3b headline on the config) ========"
+  # 8^4 HEADLINE. For a 4^4 validation run instead, set:
+  #   GRID=4.4.4.4 ; CFG=.../cfg_su3_4444_b6.0_claude.nersc  (then the 3b dense cross-check also runs)
+  GRID=8.8.8.8
+  CFG=/mnt/baracuda_14/dwms/dwf4_qcd_claude/cfg_su3_8888_b6.0_claude.nersc
+  ${BIN} --grid ${GRID} --mpi 1.1.1.1 --config ${CFG}
   rc=$?
   echo "run exit code = ${rc}"
 } 2>&1 | tee ${LOG}
