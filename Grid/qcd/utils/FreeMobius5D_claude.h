@@ -217,7 +217,18 @@ public:
   double mass;
   std::vector<Complex> boundary;      // e.g. {1,1,1,-1}
   int V4loc;                          // LOCAL (per-rank) 4D momentum count; keys Minv
-  std::vector<Eigen::MatrixXcd> Minv; // per LOCAL 4D momentum site, precomputed block inverse
+  std::vector<Eigen::MatrixXcd> Minv; // per LOCAL 4D momentum site, precomputed block inverse (host/build ref)
+  // device-resident copy of Minv for the on-device batched solve (no host round-trip). UVM (Grid::Vector
+  // = uvmAllocator) so it is host-fillable and device-readable. Laid out row-major (4Ls)x(4Ls) per SITE
+  // SLOT (oSite4*Nsimd + lane), NOT per idx4, so the kernel needs no coordinate math -- Build() scatters
+  // each idx4's inverse into the slot(s) whose local 4D coord maps to it.
+  Grid::Vector<Grid::Complex> Minv_dev;
+
+  // precomputed constant twist phase fields exp(-i ph) and exp(+i ph). ph depends only on the boundary
+  // phases + coordinates (NOT the input), so it is built ONCE in Build() and the per-apply phase becomes
+  // a pointwise multiply instead of recomputing exp(+-i ph) every apply.
+  ComplexField phase_neg;
+  ComplexField phase_pos;
 
   // apply-level timers (usecond, always-on; accumulate over applies -- profile the FFT vs the
   // block solve under MPI decomposition; report via report_timers()). FFT internal comm/kernel
@@ -230,7 +241,8 @@ public:
 
   FreeMobius5DInverse(GridCartesian* FGrid_, int Ls_, double M5_, double b_, double c_, double mass_,
                       std::vector<Complex> boundary_)
-    : FGrid(FGrid_), Ls(Ls_), M5(M5_), b(b_), c(c_), mass(mass_), boundary(boundary_) {
+    : FGrid(FGrid_), Ls(Ls_), M5(M5_), b(b_), c(c_), mass(mass_), boundary(boundary_),
+      phase_neg(FGrid_), phase_pos(FGrid_) {
     Build();
   }
 
@@ -276,6 +288,63 @@ public:
         }
       }
     }
+
+    // ---- scatter Minv into the device-resident, slot-indexed Minv_dev (Chunk 1 of the on-device
+    // batched solve). Slot = oSite4*Nsimd + lane. The local 4D coord of a (oSite4, lane) is
+    // lcoor4 = ocoor4 + rdim4 * icoor4 (Grid's lane<->coord convention, same as unvectorizeToLexOrdArray),
+    // and idx4 = local lex (x fastest) matching the Minv build above.
+    const int n5 = 4 * Ls;
+    const Coordinate& rdim5 = FGrid->_rdimensions;   // [Ls, rx, ry, rz, rt] (s: rdim=Ls, simd=1)
+    const Coordinate& simd5 = FGrid->_simd_layout;   // [1, sx, sy, sz, st]
+    Coordinate rdim4(4);
+    Coordinate simd4(4);
+    for (int mu = 0; mu < 4; ++mu) {
+      rdim4[mu] = rdim5[mu + 1];
+      simd4[mu] = simd5[mu + 1];
+    }
+    int Nsimd = 1;
+    int nOsites4 = 1;
+    for (int mu = 0; mu < 4; ++mu) {
+      Nsimd *= simd4[mu];
+      nOsites4 *= rdim4[mu];
+    }
+    Minv_dev.resize((size_t)nOsites4 * Nsimd * n5 * n5);
+    for (int oSite4 = 0; oSite4 < nOsites4; ++oSite4) {
+      Coordinate ocoor4(4);
+      Lexicographic::CoorFromIndex(ocoor4, oSite4, rdim4);
+      for (int lane = 0; lane < Nsimd; ++lane) {
+        Coordinate icoor4(4);
+        Lexicographic::CoorFromIndex(icoor4, lane, simd4);
+        int lcoor4[4];
+        for (int mu = 0; mu < 4; ++mu) {
+          lcoor4[mu] = ocoor4[mu] + rdim4[mu] * icoor4[mu];
+        }
+        int idx4 = ((lcoor4[3] * Ll[2] + lcoor4[2]) * Ll[1] + lcoor4[1]) * Ll[0] + lcoor4[0];
+        const Eigen::MatrixXcd& Mi = Minv[idx4];
+        size_t base = ((size_t)oSite4 * Nsimd + lane) * n5 * n5;
+        for (int r = 0; r < n5; ++r) {
+          for (int cc = 0; cc < n5; ++cc) {
+            std::complex<double> z = Mi(r, cc);
+            Minv_dev[base + (size_t)r * n5 + cc] = Grid::Complex(z.real(), z.imag());
+          }
+        }
+      }
+    }
+
+    // ---- precompute the constant twist phase fields (once). ph = sum_nu bph_nu * x_nu / L_nu, with
+    // bph_nu = acos(Re boundary_nu) the anti-periodic boundary phase; s = dim 0 so spacetime is dim 1..4.
+    ComplexField coor(FGrid);
+    ComplexField ph(FGrid);
+    ph = Zero();
+    ComplexD ci(0.0, 1.0);
+    int shift = 1;  // fiveD: s is dim 0
+    for (int nu = 0; nu < Nd; ++nu) {
+      LatticeCoordinate(coor, nu + shift);
+      double bph = std::acos(real(boundary[nu]));  // Grid `real`, not std:: (Complex may be thrust::complex)
+      ph = ph + bph * coor * (1.0 / (double)(FGrid->_fdimensions[nu + shift]));
+    }
+    phase_neg = exp(ci * ph * (-1.0));
+    phase_pos = exp(ci * ph);
   }
 
   // out = F in = D_DW^free(m)^{-1} in
@@ -286,18 +355,9 @@ public:
     FermionField prop_k(g);
     FFT theFFT((GridCartesian*)g);
 
-    ComplexField coor(g);
-    ComplexField ph(g);
-    ph = Zero();
-    ComplexD ci(0.0, 1.0);
-    int shift = 1;  // fiveD: s is dim 0
+    // phase: precomputed constant twist fields (Build()); per-apply is a pointwise multiply.
     double tp = -usecond();
-    for (int nu = 0; nu < Nd; ++nu) {
-      LatticeCoordinate(coor, nu + shift);
-      double bph = std::acos(real(boundary[nu]));  // Grid `real`, not std:: (Complex may be thrust::complex)
-      ph = ph + bph * coor * (1.0 / (double)(g->_fdimensions[nu + shift]));
-    }
-    in_buf = exp(ci * ph * (-1.0)) * in;
+    in_buf = phase_neg * in;
     tp += usecond();
     t_phase += tp;
 
@@ -310,7 +370,11 @@ public:
     t_fft_fwd += tf;
 
     double ts = -usecond();
-    MomentumSpaceSolve(prop_k, in_k);
+#ifdef FREEMOBIUS5D_HOST_SOLVE
+    MomentumSpaceSolve(prop_k, in_k);       // host Eigen path, A/B via -DFREEMOBIUS5D_HOST_SOLVE
+#else
+    MomentumSpaceSolve_dev(prop_k, in_k);   // on-device batched (default, no host round-trip)
+#endif
     ts += usecond();
     t_solve += ts;
 
@@ -320,7 +384,7 @@ public:
     t_fft_bwd += tb;
 
     double tp2 = -usecond();
-    out = out * exp(ci * ph);
+    out = out * phase_pos;
     tp2 += usecond();
     t_phase += tp2;
 
@@ -393,6 +457,44 @@ public:
       }
     }
     vectorizeFromLexOrdArray(out_h, prop_k);
+  }
+
+  // On-device batched block solve (Chunk 2): SAME per-momentum multiply by the precomputed inverse as
+  // MomentumSpaceSolve, but fused into ONE accelerator_for on the device field views IN PLACE -- no
+  // unvectorize/vectorize host round-trip (the GPU M0 bottleneck, 76% -- grid_freeprec_cost_benchmark_claude.md).
+  // Portable GPU+CPU: nsimd=1 (one thread per 4D oSite); the Nsimd SIMD lanes are handled explicitly via
+  // extractLane/insertLane because each lane carries its OWN (4Ls)x(4Ls) matrix (per-lane data breaks the
+  // usual coalescedRead vectorization). 5D layout: s = dim 0 (simd=1), so oSite5 = s + Ls*oSite4 (s
+  // contiguous). Colour-blind (same matrix per colour). Minv_dev is slot-indexed (oSite4*Nsimd + lane).
+  void MomentumSpaceSolve_dev(FermionField& prop_k, const FermionField& in_k) const {
+    const int Lsloc = Ls;
+    const int n5 = 4 * Lsloc;
+    const int Nsimd = (int)in_k.Grid()->Nsimd();
+    const uint64_t nOsites4 = in_k.Grid()->oSites() / (uint64_t)Lsloc;
+    const Grid::Complex* Minv_p = &Minv_dev[0];
+    autoView(in_v, in_k, AcceleratorRead);
+    autoView(out_v, prop_k, AcceleratorWrite);
+    accelerator_for(oSite4, nOsites4, 1, {
+      for (int lane = 0; lane < Nsimd; ++lane) {
+        const Grid::Complex* M = Minv_p + ((uint64_t)oSite4 * Nsimd + lane) * (uint64_t)n5 * n5;
+        for (int s = 0; s < Lsloc; ++s) {
+          SiteSpinor acc;
+          acc = Zero();
+          for (int sp = 0; sp < Lsloc; ++sp) {
+            SiteSpinor inp = extractLane(lane, in_v[sp + Lsloc * oSite4]);
+            for (int a = 0; a < 4; ++a) {
+              for (int bb = 0; bb < 4; ++bb) {
+                Grid::Complex m = M[(s * 4 + a) * n5 + (sp * 4 + bb)];
+                for (int col = 0; col < Nc; ++col) {
+                  acc()(a)(col) += m * inp()(bb)(col);
+                }
+              }
+            }
+          }
+          insertLane(lane, out_v[s + Lsloc * oSite4], acc);
+        }
+      }
+    });
   }
 };
 

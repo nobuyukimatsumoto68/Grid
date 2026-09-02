@@ -109,7 +109,7 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
 
   if (run_m0) {
     // FGMRES right-preconditioned by M0, no restart
-    M0.n_apply = 0;
+    M0.reset_timers();  // zeroes n_apply + all M0/F usecond accumulators
     FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES(solve_tol, solve_maxit, M0,
                                                               fgmres_restart, /*err_on_no_conv=*/false);
     LatticeFermionD xg(FGrid);
@@ -122,6 +122,27 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
     if (dW_cgne > 0) {
       double speedup = (dW_fgmres > 0) ? (double)dW_cgne / (double)dW_fgmres : 0.0;
       std::cout << "  D_W-apply speedup (CGNE / FGMRES-M0) = " << speedup << "x" << std::endl;
+    }
+    // COMPLETE-PICTURE benchmark: the full M0 apply breakdown (omega / phase / fft_fwd / solve /
+    // fft_bwd), then a Dhop currency measured in the SAME run/layout so M0-vs-D_W is directly
+    // comparable. The D_W-count speedup above is a COUNT; this converts M0 cost into Dhop units.
+    M0.report_timers();
+    LatticeFermionD dwin(FGrid);
+    LatticeFermionD dwout(FGrid);
+    gaussian(RNG5, dwin);
+    D.Dhop(dwin, dwout, 0);  // warm up
+    int ndw = 50;
+    double tdw = -usecond();
+    for (int i = 0; i < ndw; ++i) {
+      D.Dhop(dwin, dwout, 0);
+    }
+    tdw += usecond();
+    double dhop_us = tdw / (double)ndw;
+    std::cout << GridLogMessage << "  [Dhop] us/apply = " << dhop_us << std::endl;
+    if (M0.n_apply > 0) {
+      double m0_us = (M0.t_omega + M0.t_free) / (double)M0.n_apply;
+      std::cout << GridLogMessage << "  [M0/Dhop] full M0 apply = " << (m0_us / dhop_us)
+                << " Dhop-equivalents  (M0 us/apply = " << m0_us << ")" << std::endl;
     }
   }
 
