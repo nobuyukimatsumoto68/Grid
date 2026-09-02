@@ -36,6 +36,39 @@ static bool cmp_cplx(const std::complex<double>& a, const std::complex<double>& 
 // Flow-frame + FGMRES(M0)-vs-CGNE D_W-apply benchmark on config U (solve the ORIGINAL U).
 // Frame = WilsonFlow(flow_eps x flow_nstep) then Fourier Landau (Omega_tol 1e-12). Metric (dwf4):
 // D_W applies = CGNE 2*Ls*iters (normal op = 2 M/iter), FGMRES Ls*iters (1 M/iter; M0 costs 0 D_W).
+// Right-preconditioned non-Hermitian operator P = D o M0 (apply M0 then D) for short-recurrence solvers
+// (BiCGSTAB) that take a bare LinearOperatorBase (no built-in preconditioner). Solve P y = b -> x = M0 y
+// solves D x = b. BiCGSTAB uses Op() only; the rest assert (not called).
+template <class Field>
+class RightPrecOp : public LinearOperatorBase<Field> {
+public:
+  LinearOperatorBase<Field>& Dop;
+  LinearFunction<Field>& Prec;
+  Field tmp;
+  RightPrecOp(LinearOperatorBase<Field>& D_, LinearFunction<Field>& M_, GridBase* g)
+    : Dop(D_), Prec(M_), tmp(g) {}
+  void Op(const Field& in, Field& out) {
+    Prec(in, tmp);
+    Dop.Op(tmp, out);
+  }
+  void AdjOp(const Field& in, Field& out) { assert(0); }
+  void OpDiag(const Field& in, Field& out) { assert(0); }
+  void OpDir(const Field& in, Field& out, int dir, int disp) { assert(0); }
+  void OpDirAll(const Field& in, std::vector<Field>& out) { assert(0); }
+  void HermOp(const Field& in, Field& out) { assert(0); }
+  void HermOpAndNorm(const Field& in, Field& out, RealD& n1, RealD& n2) { assert(0); }
+};
+
+// outer-solver knobs (main sets from CLI): FGMRES restart length; whether to run the BiCGSTAB A/B.
+// default 256 = NO-RESTART. Restarting is CATASTROPHIC for F-preconditioned FGMRES: the win is
+// "deflation-by-recurrence" (the growing Krylov subspace IS the deflation), so a restart destroys it.
+// Peter Boyle's window scan (harder regime): no-restart 233 iters -> window-128 829 -> window-32 3353 ->
+// window-16 unconverged. My 8^4 m=0.1 sweep (restart 32 = only +15% iters) was too EASY to see this; do
+// NOT restart. (Memory is the real cost of no-restart; the MG smoother-slot build is what removes it.)
+static int g_fgmres_restart = 256;
+static bool g_run_bcg = false;
+static std::vector<int> g_restart_sweep;  // if set (--restart-sweep a,b,c), FGMRES solves each back-to-back
+
 static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
                          GridCartesian* UGrid, GridRedBlackCartesian* UrbGrid,
                          GridCartesian* FGrid, GridRedBlackCartesian* FrbGrid,
@@ -108,20 +141,30 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
   }
 
   if (run_m0) {
-    // FGMRES right-preconditioned by M0, no restart
-    M0.reset_timers();  // zeroes n_apply + all M0/F usecond accumulators
-    FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES(solve_tol, solve_maxit, M0,
-                                                              fgmres_restart, /*err_on_no_conv=*/false);
-    LatticeFermionD xg(FGrid);
-    xg = Zero();
-    FGMRES(LinOp, bsrc, xg);
-    int fg_iters = FGMRES.IterationCount;
-    long dW_fgmres = (long)Ls * fg_iters;
-    std::cout << "  FGMRES(M0): iters=" << fg_iters << "  M0 applies=" << M0.n_apply
-              << "  D_W applies=" << dW_fgmres << std::endl;
-    if (dW_cgne > 0) {
-      double speedup = (dW_fgmres > 0) ? (double)dW_cgne / (double)dW_fgmres : 0.0;
-      std::cout << "  D_W-apply speedup (CGNE / FGMRES-M0) = " << speedup << "x" << std::endl;
+    // FGMRES right-preconditioned by M0. If --restart-sweep given, solve at each restart length
+    // BACK-TO-BACK (same frame + GPU load -> removes cross-run drift, pins the restart optimum); else a
+    // single solve at g_fgmres_restart (default = no-restart).
+    std::vector<int> restarts = g_restart_sweep.empty() ? std::vector<int>({g_fgmres_restart})
+                                                        : g_restart_sweep;
+    for (size_t ri = 0; ri < restarts.size(); ++ri) {
+      int rl = restarts[ri];
+      M0.reset_timers();  // zeroes n_apply + all M0/F usecond accumulators
+      FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES(solve_tol, solve_maxit, M0,
+                                                                rl, /*err_on_no_conv=*/false);
+      LatticeFermionD xg(FGrid);
+      xg = Zero();
+      double tw_fg = -usecond();
+      FGMRES(LinOp, bsrc, xg);
+      tw_fg += usecond();
+      int fg_iters = FGMRES.IterationCount;
+      long dW_fgmres = (long)Ls * fg_iters;
+      std::cout << "  FGMRES(M0) restart=" << rl << ": iters=" << fg_iters
+                << "  M0 applies=" << M0.n_apply << "  D_W applies=" << dW_fgmres
+                << "  WALL=" << tw_fg / 1.0e6 << " s" << std::endl;
+      if (dW_cgne > 0) {
+        double speedup = (dW_fgmres > 0) ? (double)dW_cgne / (double)dW_fgmres : 0.0;
+        std::cout << "  D_W-apply speedup (CGNE / FGMRES-M0) = " << speedup << "x" << std::endl;
+      }
     }
     // COMPLETE-PICTURE benchmark: the full M0 apply breakdown (omega / phase / fft_fwd / solve /
     // fft_bwd), then a Dhop currency measured in the SAME run/layout so M0-vs-D_W is directly
@@ -144,6 +187,30 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
       std::cout << GridLogMessage << "  [M0/Dhop] full M0 apply = " << (m0_us / dhop_us)
                 << " Dhop-equivalents  (M0 us/apply = " << m0_us << ")" << std::endl;
     }
+  }
+
+  if (g_run_bcg) {
+    // BiCGSTAB right-preconditioned by M0 (short recurrence, NO orthogonalization; ~2 M0 applies/iter).
+    // Solve (D M0) y = b, then x = M0 y. Compare WALL to FGMRES: BiCGSTAB drops the O(iters^2)
+    // orthogonalization but pays 2 M0 applies/iter, so it wins only if it converges in fewer iters.
+    M0.reset_timers();
+    RightPrecOp<LatticeFermionD> P(LinOp, M0, FGrid);
+    BiCGSTAB<LatticeFermionD> BCG(solve_tol, solve_maxit, /*err_on_no_conv=*/false);
+    LatticeFermionD yb(FGrid);
+    yb = Zero();
+    double tw_bcg = -usecond();
+    BCG(P, bsrc, yb);
+    tw_bcg += usecond();
+    LatticeFermionD xb(FGrid);
+    M0(yb, xb);  // x = M0 y solves D x = b
+    LatticeFermionD Dxb(FGrid);
+    D.M(xb, Dxb);
+    double res = std::sqrt(norm2(Dxb - bsrc) / norm2(bsrc));
+    int bcg_iters = BCG.IterationsToComplete;
+    long dW_bcg = (long)Ls * 2 * bcg_iters;  // 2 D-applies/iter via P.Op
+    std::cout << "  BiCGSTAB(M0): iters=" << bcg_iters << "  M0 applies=" << M0.n_apply
+              << "  D_W applies=" << dW_bcg << "  WALL=" << tw_bcg / 1.0e6 << " s  true res=" << res
+              << std::endl;
   }
 
   if (run_m1) {
@@ -474,6 +541,16 @@ int main(int argc, char** argv) {
     run_cgne = (ops.find("cgne") != std::string::npos);
     run_m0 = (ops.find("m0") != std::string::npos);
     run_m1 = (ops.find("m1") != std::string::npos);
+    g_run_bcg = (ops.find("bcg") != std::string::npos);  // BiCGSTAB(M0) A/B vs FGMRES
+  }
+  // outer-solver knob: --restart N sets the FGMRES restart length (default 256 = no-restart). Lower N
+  // caps the O(iters^2) orthogonalization at the cost of possibly more iterations.
+  if (GridCmdOptionExists(argv, argv + argc, "--restart")) {
+    g_fgmres_restart = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--restart"));
+  }
+  // --restart-sweep a,b,c : FGMRES solves at each restart length back-to-back (same frame, pins optimum).
+  if (GridCmdOptionExists(argv, argv + argc, "--restart-sweep")) {
+    GridCmdOptionIntVector(GridCmdOptionPayload(argv, argv + argc, "--restart-sweep"), g_restart_sweep);
   }
 
   // gate 2 (pure-gauge) + the Hot-config shakeout are config-INDEPENDENT validations. Skip BOTH for a

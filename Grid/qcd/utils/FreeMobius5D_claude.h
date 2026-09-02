@@ -31,6 +31,8 @@
 #include <cmath>
 #include <vector>
 #include <Grid/Grid.h>
+#include <Grid/algorithms/BlockingFFT_claude.h>  // SIMD-blocking FFT (used under -DFREEMOBIUS5D_BLOCKING_FFT)
+#include <Grid/algorithms/FFT_claude.h>          // cached-plan/pgbuf FFT (DEFAULT; -DFREEMOBIUS5D_GRID_FFT = Grid's uncached)
 
 namespace Grid {
 
@@ -230,6 +232,14 @@ public:
   ComplexField phase_neg;
   ComplexField phase_pos;
 
+  // (a) hoisted per-apply scratch buffers + (b) cached-plan/pgbuf FFT -- allocated ONCE (members), reused
+  // every apply instead of reallocating/re-planning per apply/per-FFT_dim-call (the working-space knob).
+  typedef typename FermionField::vector_object::scalar_type FftScalar;
+  FermionField m_in_buf;
+  FermionField m_in_k;
+  FermionField m_prop_k;
+  FFT_claude<FftScalar> m_fft;
+
   // apply-level timers (usecond, always-on; accumulate over applies -- profile the FFT vs the
   // block solve under MPI decomposition; report via report_timers()). FFT internal comm/kernel
   // split (t_shift/t_fft) comes separately from FFT.h under --log Performance.
@@ -242,7 +252,8 @@ public:
   FreeMobius5DInverse(GridCartesian* FGrid_, int Ls_, double M5_, double b_, double c_, double mass_,
                       std::vector<Complex> boundary_)
     : FGrid(FGrid_), Ls(Ls_), M5(M5_), b(b_), c(c_), mass(mass_), boundary(boundary_),
-      phase_neg(FGrid_), phase_pos(FGrid_) {
+      phase_neg(FGrid_), phase_pos(FGrid_),
+      m_in_buf(FGrid_), m_in_k(FGrid_), m_prop_k(FGrid_), m_fft(FGrid_) {
     Build();
   }
 
@@ -319,6 +330,12 @@ public:
         for (int mu = 0; mu < 4; ++mu) {
           lcoor4[mu] = ocoor4[mu] + rdim4[mu] * icoor4[mu];
         }
+#ifdef FREEMOBIUS5D_BLOCKING_FFT
+        // The SIMD-blocking FFT places t-momentum kt = icoor_t + sd*ocoor_t at slot (ocoor_t, icoor_t)
+        // (digit-reversal vs Grid's freq=coord). Re-key the t-component so Minv_dev matches that ordering;
+        // x,y,z are sd=1 -> unchanged. See grid_blocking_fft_impl_plan_claude.md.
+        lcoor4[3] = icoor4[3] + simd4[3] * ocoor4[3];
+#endif
         int idx4 = ((lcoor4[3] * Ll[2] + lcoor4[2]) * Ll[1] + lcoor4[1]) * Ll[0] + lcoor4[0];
         const Eigen::MatrixXcd& Mi = Minv[idx4];
         size_t base = ((size_t)oSite4 * Nsimd + lane) * n5 * n5;
@@ -349,11 +366,17 @@ public:
 
   // out = F in = D_DW^free(m)^{-1} in
   virtual void operator()(const FermionField& in, FermionField& out) {
-    GridBase* g = in.Grid();
-    FermionField in_buf(g);
-    FermionField in_k(g);
-    FermionField prop_k(g);
-    FFT theFFT((GridCartesian*)g);
+    // (a) reuse the hoisted member scratch buffers (no per-apply allocation).
+    FermionField& in_buf = m_in_buf;
+    FermionField& in_k = m_in_k;
+    FermionField& prop_k = m_prop_k;
+    Coordinate mask(Nd + 1, 1);
+    mask[0] = 0;  // do not FFT the s-dimension
+#ifdef FREEMOBIUS5D_BLOCKING_FFT
+    BlockingFFT<FermionField> bfft(FGrid);  // SIMD-blocking FFT (no pack); Minv_dev is re-keyed
+#elif defined(FREEMOBIUS5D_GRID_FFT)
+    FFT theFFT(FGrid);                      // Grid's UNCACHED FFT (A/B baseline)
+#endif
 
     // phase: precomputed constant twist fields (Build()); per-apply is a pointwise multiply.
     double tp = -usecond();
@@ -361,11 +384,14 @@ public:
     tp += usecond();
     t_phase += tp;
 
-    std::vector<int> mask(Nd + 1, 1);
-    mask[0] = 0;  // do not FFT the s-dimension
-
     double tf = -usecond();
+#ifdef FREEMOBIUS5D_BLOCKING_FFT
+    bfft.FFT_spacetime(in_k, in_buf, FFT::forward);
+#elif defined(FREEMOBIUS5D_GRID_FFT)
     theFFT.FFT_dim_mask(in_k, in_buf, mask, FFT::forward);
+#else
+    m_fft.FFT_dim_mask(in_k, in_buf, mask, FFT::forward);  // DEFAULT: cached plan/pgbuf
+#endif
     tf += usecond();
     t_fft_fwd += tf;
 
@@ -379,7 +405,13 @@ public:
     t_solve += ts;
 
     double tb = -usecond();
+#ifdef FREEMOBIUS5D_BLOCKING_FFT
+    bfft.FFT_spacetime(out, prop_k, FFT::backward);
+#elif defined(FREEMOBIUS5D_GRID_FFT)
     theFFT.FFT_dim_mask(out, prop_k, mask, FFT::backward);
+#else
+    m_fft.FFT_dim_mask(out, prop_k, mask, FFT::backward);  // DEFAULT: cached plan/pgbuf
+#endif
     tb += usecond();
     t_fft_bwd += tb;
 
