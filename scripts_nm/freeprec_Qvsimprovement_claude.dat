@@ -1,0 +1,14 @@
+# R2: preconditioner improvement vs flowed topological charge (M0, 16^4 Iwasaki b2.6).
+# |Q| = |flowed Q_5Li at tau~2| (integer plateau); speedup = CGNE D_W / FGMRES(M0) D_W.
+# cols: |Q|   M0_speedup   config   Q_signed   plaq(orig)
+8   2.47   ckpoint_lat.80    -8   0.670215
+7   2.32   ckpoint_lat.120   -7   0.670603
+6   5.17   ckpoint_lat.160   -6   0.670736
+6   5.24   ckpoint_lat.440   -6   0.671062
+6   2.48   ckpoint_lat.480   -6   0.671231
+4   4.61   ckpoint_lat.200   -4   0.670351
+3   5.46   ckpoint_lat.240   -3   0.671162
+3   6.66   ckpoint_lat.280   -3   0.670610
+3   5.25   ckpoint_lat.320   -3   0.670297
+3   4.80   ckpoint_lat.360   -3   0.671085
+3   4.88   ckpoint_lat.400   -3   0.670768
