@@ -41,7 +41,7 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
                          GridCartesian* FGrid, GridRedBlackCartesian* FrbGrid,
                          int Ls, double M5, double bb, double cc, double mm,
                          std::vector<Complex> boundary, double flow_eps, int flow_nstep,
-                         GridParallelRNG& RNG5) {
+                         GridParallelRNG& RNG5, bool run_cgne, bool run_m0, bool run_m1) {
   std::cout << "==== headline: FGMRES(M0) vs CGNE D_W-count  [" << tag << "] ====" << std::endl;
 
   Real plaq0 = WilsonLoops<PeriodicGimplD>::avgPlaquette(U);
@@ -66,8 +66,13 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
       /*err_on_no_converge=*/false);
   Real landau = 1.0 - WilsonLoops<PeriodicGimplD>::linkTrace(Uflowed);
   Real Q = WilsonLoops<PeriodicGimplD>::TopologicalCharge(U);
+  // Q_5Li on the SAME Uflowed used to build Omega = the frame-flow charge. If it sits on the integer,
+  // the tau=2 Wilson flow did NOT destroy the instanton (the lump survives into the frame). 5Li is the
+  // clean measure here; Q(orig) above is UV-noisy clover on the rough config -- not the physics Q.
+  Real Qflow = WilsonLoops<PeriodicGimplD>::TopologicalCharge5Li(Uflowed);
   std::cout << "  plaq=" << plaq0 << "  flowed plaq=" << plaq_flowed
-            << "  flowed-fixed Landau functional=" << landau << "  Q(orig)=" << Q << std::endl;
+            << "  flowed-fixed Landau functional=" << landau << "  Q(orig)=" << Q
+            << "  Q_5Li(frame-flowed tau=" << (flow_eps * flow_nstep) << ")=" << Qflow << std::endl;
 
   WilsonImplD::ImplParams Params(boundary);
   MobiusFermionD D(U, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
@@ -80,33 +85,74 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
   int solve_maxit = 4000;
   int fgmres_restart = 256;  // no-restart: RestartLength >> expected iters, not literally maxit (OOM)
 
-  // CGNE baseline: CG on MdagM, src = Mdag b
-  MdagMLinearOperator<MobiusFermionD, LatticeFermionD> HermOp(D);
-  LatticeFermionD bn(FGrid);
-  D.Mdag(bsrc, bn);
-  LatticeFermionD xcg(FGrid);
-  xcg = Zero();
-  ConjugateGradient<LatticeFermionD> CG(solve_tol, solve_maxit);
-  CG(HermOp, bn, xcg);
-  int cg_iters = CG.IterationsToComplete;
-  long dW_cgne = (long)2 * Ls * cg_iters;
-
-  // FGMRES right-preconditioned by M0, no restart
+  // LinOp on the ORIGINAL operator D, shared by the M0 and M1 FGMRES solves.
   NonHermitianLinearOperator<MobiusFermionD, LatticeFermionD> LinOp(D);
-  M0.n_apply = 0;
-  FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES(solve_tol, solve_maxit, M0,
-                                                            fgmres_restart, /*err_on_no_conv=*/false);
-  LatticeFermionD xg(FGrid);
-  xg = Zero();
-  FGMRES(LinOp, bsrc, xg);
-  int fg_iters = FGMRES.IterationCount;
-  long dW_fgmres = (long)Ls * fg_iters;
 
-  std::cout << "  CGNE:       iters=" << cg_iters << "  D_W applies=" << dW_cgne << std::endl;
-  std::cout << "  FGMRES(M0): iters=" << fg_iters << "  M0 applies=" << M0.n_apply
-            << "  D_W applies=" << dW_fgmres << std::endl;
-  double speedup = (dW_fgmres > 0) ? (double)dW_cgne / (double)dW_fgmres : 0.0;
-  std::cout << "  D_W-apply speedup (CGNE / FGMRES) = " << speedup << "x" << std::endl;
+  // ADDITIVE op selection (Nobu): run_cgne / run_m0 / run_m1 each turn ON a solve; nothing is
+  // force-skipped. Each op's D_W count is printed on its own; cross-op ratios that need a count NOT
+  // computed this run (e.g. FGMRES-M1 speedup vs CGNE when only --ops m1) are taken from the prior
+  // freeprec_<cfg>_claude.log. flow + Landau above always run (M0 and M1 both need Omega / U^L).
+  long dW_cgne = 0;
+  if (run_cgne) {
+    // CGNE baseline: CG on MdagM, src = Mdag b
+    MdagMLinearOperator<MobiusFermionD, LatticeFermionD> HermOp(D);
+    LatticeFermionD bn(FGrid);
+    D.Mdag(bsrc, bn);
+    LatticeFermionD xcg(FGrid);
+    xcg = Zero();
+    ConjugateGradient<LatticeFermionD> CG(solve_tol, solve_maxit);
+    CG(HermOp, bn, xcg);
+    int cg_iters = CG.IterationsToComplete;
+    dW_cgne = (long)2 * Ls * cg_iters;
+    std::cout << "  CGNE:       iters=" << cg_iters << "  D_W applies=" << dW_cgne << std::endl;
+  }
+
+  if (run_m0) {
+    // FGMRES right-preconditioned by M0, no restart
+    M0.n_apply = 0;
+    FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES(solve_tol, solve_maxit, M0,
+                                                              fgmres_restart, /*err_on_no_conv=*/false);
+    LatticeFermionD xg(FGrid);
+    xg = Zero();
+    FGMRES(LinOp, bsrc, xg);
+    int fg_iters = FGMRES.IterationCount;
+    long dW_fgmres = (long)Ls * fg_iters;
+    std::cout << "  FGMRES(M0): iters=" << fg_iters << "  M0 applies=" << M0.n_apply
+              << "  D_W applies=" << dW_fgmres << std::endl;
+    if (dW_cgne > 0) {
+      double speedup = (dW_fgmres > 0) ? (double)dW_cgne / (double)dW_fgmres : 0.0;
+      std::cout << "  D_W-apply speedup (CGNE / FGMRES-M0) = " << speedup << "x" << std::endl;
+    }
+  }
+
+  if (run_m1) {
+    // FGMRES right-preconditioned by M1 (leading D_W correction, EXACT split tildeA = U^L - 1).
+    // U^L = Omega U Omega^dag (the ORIGINAL config framed); D_DW[U^L] is a second Mobius operator.
+    LatticeGaugeFieldD UL(UGrid);
+    UL = U;
+    SU<Nc>::GaugeTransform<PeriodicGimplD>(UL, xform);  // U^L = Omega U Omega^dag, in place
+    MobiusFermionD Dframed(UL, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
+    FreeLimitPreconditioner1<WilsonImplD> M1(Ffree, xform, Dframed, FGrid);
+    FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES1(solve_tol, solve_maxit, M1,
+                                                               fgmres_restart, /*err_on_no_conv=*/false);
+    LatticeFermionD xg1(FGrid);
+    xg1 = Zero();
+    FGMRES1(LinOp, bsrc, xg1);
+    int fg1_iters = FGMRES1.IterationCount;
+    // Honest metric: M1 is NOT D_W-free. Total = outer (Ls per FGMRES iter) + M1-internal D_DW[U^L]
+    // (Ls per M1 apply). n_dw counts the framed-Mobius applies directly.
+    long dW_fgmres1 = (long)Ls * fg1_iters + (long)Ls * M1.n_dw;
+    std::cout << "  FGMRES(M1): iters=" << fg1_iters << "  M1 applies=" << M1.n_apply
+              << "  internal D_DW[U^L]=" << M1.n_dw
+              << "  D_W applies(total)=" << dW_fgmres1 << std::endl;
+    if (dW_cgne > 0) {
+      double speedup1 = (dW_fgmres1 > 0) ? (double)dW_cgne / (double)dW_fgmres1 : 0.0;
+      std::cout << "  D_W-apply speedup (CGNE / FGMRES-M1) = " << speedup1 << "x" << std::endl;
+    } else {
+      std::cout << "  D_W-apply speedup (CGNE / FGMRES-M1) = n/a this run (divide the logged CGNE D_W by "
+                << dW_fgmres1 << ")" << std::endl;
+    }
+  }
 }
 
 // 4^4 bit-exact gate: build D_W(-M5) (mass-normalized, AP-time) on the loaded config, form the dense
@@ -396,6 +442,19 @@ int main(int argc, char** argv) {
   bool have_cfg = GridCmdOptionExists(argv, argv + argc, "--config");
   bool gate2 = true;
 
+  // ADDITIVE op selection: --ops <comma-list of cgne,m0,m1> chooses which headline solves to run.
+  // Default (no --ops) = all three. Nobu: add, don't restrict -- naming an op turns it ON, and an op
+  // NOT run this pass is taken from the prior freeprec_<cfg>_claude.log for any cross-op ratio.
+  bool run_cgne = true;
+  bool run_m0 = true;
+  bool run_m1 = true;
+  if (GridCmdOptionExists(argv, argv + argc, "--ops")) {
+    std::string ops = GridCmdOptionPayload(argv, argv + argc, "--ops");
+    run_cgne = (ops.find("cgne") != std::string::npos);
+    run_m0 = (ops.find("m0") != std::string::npos);
+    run_m1 = (ops.find("m1") != std::string::npos);
+  }
+
   // gate 2 (pure-gauge) + the Hot-config shakeout are config-INDEPENDENT validations. Skip BOTH for a
   // real --config run: gate 2 is already validated at 4^4, and its pure-gauge fix uses alpha=0.1 (the
   // uncorrected 16x-too-large step) which could diverge at 8^4 and spuriously fail the run. Gate 1
@@ -448,7 +507,7 @@ int main(int argc, char** argv) {
     LatticeGaugeFieldD Uh(UGrid);
     SU<Nc>::HotConfiguration(RNG4, Uh);
     run_headline("Hot config -- shakeout", Uh, UGrid, UrbGrid, FGrid, FrbGrid,
-                 Ls, M5, bb, cc, mm, boundary, 0.02, 100, RNG5);
+                 Ls, M5, bb, cc, mm, boundary, 0.02, 100, RNG5, run_cgne, run_m0, run_m1);
   }
 
   // ---------- chunk 3b: NERSC config cross-check + headline (only if --config <nersc-file> given) ----------
@@ -469,7 +528,7 @@ int main(int argc, char** argv) {
     bool full_spectrum = GridCmdOptionExists(argv, argv + argc, "--full-spectrum");
     gate3b = nersc_crosscheck(Ureal, evalfile, UGrid, UrbGrid, M5, boundary, full_spectrum);
     run_headline("NERSC SU(3) beta6 -- HEADLINE", Ureal, UGrid, UrbGrid, FGrid, FrbGrid,
-                 Ls, M5, bb, cc, mm, boundary, 0.02, 100, RNG5);
+                 Ls, M5, bb, cc, mm, boundary, 0.02, 100, RNG5, run_cgne, run_m0, run_m1);
   }
 
   bool pass = (maxerr0a < 1e-10) && (maxrel0b < 1e-4) && gate1 && gate2 && gate3b;

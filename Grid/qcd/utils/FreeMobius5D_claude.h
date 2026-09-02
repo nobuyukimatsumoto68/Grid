@@ -360,5 +360,49 @@ public:
   }
 };
 
+// -------------------- CHUNK 4: M1 = leading D_W (hopping-expansion) correction --------------------
+// M1 = Omega^dag { F - F D(tildeA) F } Omega, EXACT operator split tildeA = U^L - 1, so
+//   D(tildeA) = D_DW[U^L] - D_free,  U^L = Omega U Omega^dag  (the ORIGINAL config framed, NOT flowed).
+// Cheap apply (uses D_free F = I, hence D_free y0 = D_free F phi = phi):
+//   phi = Omega in ; y0 = F phi ; tmp = D_DW[U^L] y0 ; w = tmp - phi ; y1 = F w ; out = Omega^dag (y0 - y1).
+// Cost per M1 apply: 2 free (FFT) inverses (D_W-free) + ONE D_DW[U^L] apply (= Ls D_W). So UNLIKE M0, M1
+// is NOT D_W-free -- the honest metric adds Ls per M1 apply (n_dw) to the outer FGMRES D_W count.
+// Idea R. Brower + T. Izubuchi; ref dwf4 GaugeCovFreeDW1 (qed2/dwf4_qcd_claude/dwf4_gaugefix_claude.h:294),
+// derivation qed2/dwf4_qcd_claude/global_hopping_claude.md.
+template <class Impl>
+class FreeLimitPreconditioner1 : public LinearFunction<typename Impl::FermionField> {
+public:
+  typedef typename Impl::FermionField FermionField;
+  FreeMobius5DInverse<Impl>& F;
+  MobiusFermion<Impl>& Dframed;   // D_DW on the framed config U^L = Omega U Omega^dag
+  LatticeColourMatrixD Omega5;    // the 4D frame broadcast onto the 5D grid
+  long n_apply;                   // counts M1 applies (= outer FGMRES iters)
+  long n_dw;                      // counts D_DW[U^L] applies (each = Ls D_W)
+
+  FreeLimitPreconditioner1(FreeMobius5DInverse<Impl>& F_, const LatticeColourMatrixD& xform4,
+                           MobiusFermion<Impl>& Dframed_, GridCartesian* FGrid)
+    : F(F_), Dframed(Dframed_), Omega5(FGrid), n_apply(0), n_dw(0) {
+    for (int s = 0; s < F.Ls; ++s) {
+      InsertSlice(xform4, Omega5, s, 0);  // broadcast Omega(x) onto every s-slice
+    }
+  }
+
+  virtual void operator()(const FermionField& in, FermionField& out) {
+    n_apply++;
+    FermionField phi(in.Grid());
+    FermionField y0(in.Grid());
+    FermionField tmp(in.Grid());
+    FermionField w(in.Grid());
+    FermionField y1(in.Grid());
+    phi = Omega5 * in;      // Omega : colour mat-vec per site (spin untouched)
+    F(phi, y0);            // y0 = F phi
+    Dframed.M(y0, tmp);    // tmp = D_DW[U^L] y0
+    n_dw++;
+    w = tmp - phi;         // D(tildeA) y0 = D_DW[U^L] y0 - D_free y0 = D_DW[U^L] y0 - phi
+    F(w, y1);             // y1 = F D(tildeA) y0
+    out = adj(Omega5) * (y0 - y1);  // Omega^dag ( y0 - F D(tildeA) F phi )
+  }
+};
+
 }  // namespace Grid
 #endif
