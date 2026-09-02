@@ -216,9 +216,17 @@ public:
   double c;
   double mass;
   std::vector<Complex> boundary;      // e.g. {1,1,1,-1}
-  Coordinate ldim;                    // 5D dims [Ls, Lx, Ly, Lz, Lt]
-  int V4;
-  std::vector<Eigen::MatrixXcd> Minv; // per 4D momentum site, precomputed block inverse
+  int V4loc;                          // LOCAL (per-rank) 4D momentum count; keys Minv
+  std::vector<Eigen::MatrixXcd> Minv; // per LOCAL 4D momentum site, precomputed block inverse
+
+  // apply-level timers (usecond, always-on; accumulate over applies -- profile the FFT vs the
+  // block solve under MPI decomposition; report via report_timers()). FFT internal comm/kernel
+  // split (t_shift/t_fft) comes separately from FFT.h under --log Performance.
+  double t_phase = 0.0;
+  double t_fft_fwd = 0.0;
+  double t_solve = 0.0;
+  double t_fft_bwd = 0.0;
+  long n_apply = 0;
 
   FreeMobius5DInverse(GridCartesian* FGrid_, int Ls_, double M5_, double b_, double c_, double mass_,
                       std::vector<Complex> boundary_)
@@ -227,7 +235,6 @@ public:
   }
 
   void Build() {
-    ldim = FGrid->_fdimensions;
     assert((int)boundary.size() == Nd);
     // effective twist including the anti-periodic boundary phase
     std::vector<double> tw(Nd, 0.0);
@@ -235,20 +242,35 @@ public:
       double bph = std::acos(real(boundary[mu]));  // Grid `real`, not std:: (Complex may be thrust::complex)
       tw[mu] = bph / (2.0 * M_PI);
     }
-    int L[4] = {ldim[1], ldim[2], ldim[3], ldim[4]};
-    V4 = L[0] * L[1] * L[2] * L[3];
+    // MPI-correct momentum grid: each rank owns a LOCAL 4D sub-block. The momentum VALUE at a site
+    // uses the GLOBAL coordinate kglob = rank_offset + local_coord and the GLOBAL extent Lg; only
+    // the Minv INDEXING is local. At --mpi 1.1.1.1 (Ll == Lg, off == 0) this reduces to the old
+    // single-rank build bit-for-bit. Local 4D lex has x fastest (idx4 = kx + Ll[0]*(ky + ...)),
+    // matching Grid IndexFromCoor / the i5 = s + Ls*idx4 order that unvectorizeToLexOrdArray
+    // produces on the [Ls,Lx,Ly,Lz,Lt] grid (dim 0 = s fastest).
+    const Coordinate& fdim = FGrid->_fdimensions;    // global 5D dims [Ls, Lx, Ly, Lz, Lt]
+    const Coordinate& lodim = FGrid->_ldimensions;   // local 5D dims (this rank)
+    const Coordinate& pcoor = FGrid->_processor_coor;
+    int Lg[4] = {fdim[1], fdim[2], fdim[3], fdim[4]};
+    int Ll[4] = {lodim[1], lodim[2], lodim[3], lodim[4]};
+    int off[4];
+    for (int mu = 0; mu < 4; ++mu) {
+      off[mu] = pcoor[mu + 1] * Ll[mu];
+    }
+    V4loc = Ll[0] * Ll[1] * Ll[2] * Ll[3];
     FreeMobius5DBlock blk(Ls, M5, b, c, mass);
-    Minv.resize(V4);
-    for (int kt = 0; kt < L[3]; ++kt) {
-      for (int kz = 0; kz < L[2]; ++kz) {
-        for (int ky = 0; ky < L[1]; ++ky) {
-          for (int kx = 0; kx < L[0]; ++kx) {
-            int k[4] = {kx, ky, kz, kt};
+    Minv.resize(V4loc);
+    for (int kt = 0; kt < Ll[3]; ++kt) {
+      for (int kz = 0; kz < Ll[2]; ++kz) {
+        for (int ky = 0; ky < Ll[1]; ++ky) {
+          for (int kx = 0; kx < Ll[0]; ++kx) {
+            int kc[4] = {kx, ky, kz, kt};
             std::array<double, 4> p;
             for (int mu = 0; mu < 4; ++mu) {
-              p[mu] = 2.0 * M_PI * (k[mu] + tw[mu]) / L[mu];
+              int kglob = off[mu] + kc[mu];
+              p[mu] = 2.0 * M_PI * (kglob + tw[mu]) / Lg[mu];
             }
-            int idx = ((kt * L[2] + kz) * L[1] + ky) * L[0] + kx;
+            int idx = ((kt * Ll[2] + kz) * Ll[1] + ky) * Ll[0] + kx;
             Minv[idx] = blk.build_block(p).inverse();
           }
         }
@@ -269,35 +291,82 @@ public:
     ph = Zero();
     ComplexD ci(0.0, 1.0);
     int shift = 1;  // fiveD: s is dim 0
+    double tp = -usecond();
     for (int nu = 0; nu < Nd; ++nu) {
       LatticeCoordinate(coor, nu + shift);
       double bph = std::acos(real(boundary[nu]));  // Grid `real`, not std:: (Complex may be thrust::complex)
       ph = ph + bph * coor * (1.0 / (double)(g->_fdimensions[nu + shift]));
     }
     in_buf = exp(ci * ph * (-1.0)) * in;
+    tp += usecond();
+    t_phase += tp;
 
     std::vector<int> mask(Nd + 1, 1);
     mask[0] = 0;  // do not FFT the s-dimension
-    theFFT.FFT_dim_mask(in_k, in_buf, mask, FFT::forward);
-    MomentumSpaceSolve(prop_k, in_k);
-    theFFT.FFT_dim_mask(out, prop_k, mask, FFT::backward);
 
+    double tf = -usecond();
+    theFFT.FFT_dim_mask(in_k, in_buf, mask, FFT::forward);
+    tf += usecond();
+    t_fft_fwd += tf;
+
+    double ts = -usecond();
+    MomentumSpaceSolve(prop_k, in_k);
+    ts += usecond();
+    t_solve += ts;
+
+    double tb = -usecond();
+    theFFT.FFT_dim_mask(out, prop_k, mask, FFT::backward);
+    tb += usecond();
+    t_fft_bwd += tb;
+
+    double tp2 = -usecond();
     out = out * exp(ci * ph);
+    tp2 += usecond();
+    t_phase += tp2;
+
+    n_apply++;
+  }
+
+  // Per-apply timing averages (microseconds), plus the FFT fraction of the F apply. The FFT's own
+  // comm-vs-kernel split (t_shift vs t_fft) is emitted by FFT.h under --log Performance.
+  void report_timers() const {
+    if (n_apply == 0) {
+      return;
+    }
+    double n = (double)n_apply;
+    double tot = t_phase + t_fft_fwd + t_solve + t_fft_bwd;
+    std::cout << GridLogMessage << "[F timers] " << n_apply << " applies, avg us/apply:" << std::endl;
+    std::cout << GridLogMessage << "  phase   " << t_phase / n << std::endl;
+    std::cout << GridLogMessage << "  fft_fwd " << t_fft_fwd / n << std::endl;
+    std::cout << GridLogMessage << "  solve   " << t_solve / n << std::endl;
+    std::cout << GridLogMessage << "  fft_bwd " << t_fft_bwd / n << std::endl;
+    std::cout << GridLogMessage << "  total   " << tot / n << std::endl;
+    std::cout << GridLogMessage << "  FFT fraction (fwd+bwd)/total = " << (t_fft_fwd + t_fft_bwd) / tot << std::endl;
+  }
+
+  void reset_timers() {
+    t_phase = 0.0;
+    t_fft_fwd = 0.0;
+    t_solve = 0.0;
+    t_fft_bwd = 0.0;
+    n_apply = 0;
   }
 
   // per-momentum dense block solve (colour-blind), Minv precomputed. Gather/scatter the whole 5D field
   // via BULK host<->device transfers (unvectorize/vectorizeFromLexOrdArray) -- one pair per apply, NOT a
   // peekSite/pokeSite per (site,s) (which is ~V4*Ls*2 device syncs/apply, e.g. ~65k at 8^4 -> ~4.6M over
-  // an FGMRES solve: a peekSite storm). The 5D lex index has s FASTEST: i5 = s + Ls*idx4, with idx4 the
-  // 4D lex index (x fastest) that also keys Minv -- matches Grid's IndexFromCoor for the [Ls,Lx,Ly,Lz,Lt]
-  // grid (dim 0 = s). Validated by the cold gate staying at machine eps.
+  // an FGMRES solve: a peekSite storm). unvectorizeToLexOrdArray is a strictly LOCAL (per-rank) transfer
+  // over lSites (Lattice_transfer.h:1129, _ldimensions/_rdimensions), so we index over the LOCAL momentum
+  // count V4loc. The local 5D lex index has s FASTEST: i5 = s + Ls*idx4, with idx4 the LOCAL 4D lex index
+  // (x fastest) that also keys the LOCAL Minv -- matches Grid's IndexFromCoor for the [Ls,Lx,Ly,Lz,Lt]
+  // grid (dim 0 = s). Validated by the cold gate staying at machine eps (both single- and multi-rank).
   void MomentumSpaceSolve(FermionField& prop_k, const FermionField& in_k) const {
     int n5 = 4 * Ls;
-    int V5 = Ls * V4;
+    int V5 = Ls * V4loc;
     std::vector<SiteSpinor> in_h(V5);
     std::vector<SiteSpinor> out_h(V5);
     unvectorizeToLexOrdArray(in_h, in_k);
-    for (int idx4 = 0; idx4 < V4; ++idx4) {
+    for (int idx4 = 0; idx4 < V4loc; ++idx4) {
       const Eigen::MatrixXcd& Mi = Minv[idx4];
       Eigen::MatrixXcd Fin(n5, Nc);
       for (int s = 0; s < Ls; ++s) {
@@ -341,6 +410,8 @@ public:
   FreeMobius5DInverse<Impl>& F;
   LatticeColourMatrixD Omega5;  // the 4D frame broadcast onto the 5D grid
   long n_apply;                 // counts M0 applies (= outer FGMRES iters; M0 costs 0 D_W)
+  double t_omega = 0.0;         // Omega + Omega^dag colour mat-vec time (us, accumulated)
+  double t_free = 0.0;          // inner F apply time (us, accumulated)
 
   FreeLimitPreconditioner(FreeMobius5DInverse<Impl>& F_, const LatticeColourMatrixD& xform4,
                           GridCartesian* FGrid)
@@ -354,9 +425,39 @@ public:
     n_apply++;
     FermionField phi(in.Grid());
     FermionField y(in.Grid());
+    double to = -usecond();
     phi = Omega5 * in;      // Omega : colour mat-vec per site (spin untouched)
+    to += usecond();
+    t_omega += to;
+
+    double tfr = -usecond();
     F(phi, y);             // free Mobius inverse
+    tfr += usecond();
+    t_free += tfr;
+
+    double to2 = -usecond();
     out = adj(Omega5) * y;  // Omega^dag
+    to2 += usecond();
+    t_omega += to2;
+  }
+
+  // Per-apply averages for M0, then the inner F breakdown (FFT vs block solve).
+  void report_timers() const {
+    if (n_apply == 0) {
+      return;
+    }
+    double n = (double)n_apply;
+    std::cout << GridLogMessage << "[M0 timers] " << n_apply << " applies, avg us/apply:" << std::endl;
+    std::cout << GridLogMessage << "  omega (fwd+dag) " << t_omega / n << std::endl;
+    std::cout << GridLogMessage << "  F (free inv)    " << t_free / n << std::endl;
+    F.report_timers();
+  }
+
+  void reset_timers() {
+    t_omega = 0.0;
+    t_free = 0.0;
+    n_apply = 0;
+    F.reset_timers();
   }
 };
 
