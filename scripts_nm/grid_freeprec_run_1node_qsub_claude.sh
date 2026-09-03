@@ -11,11 +11,11 @@
 # All text output (the tee'd program log AND the SGE job .o file) goes to ${ROOT}/log/.
 
 #$ -P qfe
-#$ -M mtsmtnbyk@gmail.com
+##$ -M mtsmtnbyk@gmail.com
 #$ -N freeprec
 #$ -j y
 #$ -o /projectnb/qfe/nmatsum/dwf/log/
-#$ -m beas
+##$ -m n
 #$ -l h_rt=1:45:00
 #$ -pe omp 16
 

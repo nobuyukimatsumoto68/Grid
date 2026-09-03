@@ -9,10 +9,11 @@
 # Watch:   qstat -u $USER ; ls <DATDIR>/flowQ_*.dat
 
 #$ -P qfe
-#$ -M mtsmtnbyk@gmail.com
+##$ -M mtsmtnbyk@gmail.com
 #$ -N flowQ
 #$ -j y
-#$ -m beas
+#$ -o /projectnb/qfe/nmatsum/dwf/log/
+##$ -m n
 #$ -l h_rt=2:00:00
 #$ -pe omp 16
 

@@ -18,8 +18,8 @@
 #   qsub -l gpu_type=V100 ...   (V100 = cc 7.0), or rebuild the library multi-arch.
 
 #$ -P qfe
-#$ -M nmatsum@bu.edu
-#$ -m ea
+##$ -M nmatsum@bu.edu
+##$ -m n
 #$ -j y
 #$ -N freeprec
 #$ -l gpus=1

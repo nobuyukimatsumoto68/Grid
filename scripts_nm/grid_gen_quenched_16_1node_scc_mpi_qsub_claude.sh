@@ -11,11 +11,11 @@
 # Watch:   qstat -u $USER ; tail -f <OUTDIR>/gen_mpi_claude.log   (Grid prints per-trajectory wall time)
 
 #$ -P qfe
-#$ -M mtsmtnbyk@gmail.com
+##$ -M mtsmtnbyk@gmail.com
 #$ -N gen_iwa16_1n
 #$ -j y
 #$ -o /projectnb/qfe/nmatsum/dwf/log/
-#$ -m beas
+##$ -m n
 #$ -l h_rt=6:00:00
 #$ -pe omp 16
 

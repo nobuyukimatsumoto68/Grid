@@ -26,8 +26,11 @@ with $E(t)$ the (clover) action density along the flow. **$t_0$ becomes THE unit
 discussed** -- flow times, step sizes, and the frame-flow time are all quoted as $t/t_0$ (dimensionless),
 so results are comparable across $\beta$ and volume at a fixed physical scale. (Also compute/record $w_0$
 from $t\,\frac{d}{dt}[t^2\langle E\rangle]|_{w_0^2}=0.3$ if convenient -- BMW 1203.4469 -- as a cross-check
-scale.) ACTION ITEM: extend the flow driver to print $t^2\langle E\rangle(t)$ and solve for $t_0$ (and
-report $\sqrt{t_0}$, $Q$ vs $t$) per config; average $t_0$ over the ensemble.
+scale.) DONE (2026-09-02): $t_0$ set with NO driver edit -- reconstructed $t^2\langle E\rangle_\text{plaq}
+= 36\,t^2(1-\bar P)$ from the `plaq` column already in the flow logs (Grid `WilsonFlow.h:161-169`), ensemble
+mean crossing 0.3 (`grid_t0_reconstruct_claude.sh`). Nobu: "Iwasaki flow is fine". Results in memory
+`project-r2-config-gen` (b2.6 $t_0/a^2$=2.91; scan 0.76/1.14/1.70). Clover $t_0$ (tighter) would need a
+driver edit -- not done, not needed.
 
 ### 1b. Scan the frame-flow choices -- find what is optimal
 Vary, and measure the resulting preconditioner quality (the $D_W$-apply ratio CGNE / free-prec, i.e. the
@@ -42,6 +45,49 @@ headline metric; secondarily the flowed-fixed Landau functional and the low-mode
   Iwasaki $-0.331$, DBW2 $-1.4088$, anti-Iwasaki $+0.331$ (all with $c_0 + 8 c_1 = 1$ to fix the
   flow-time scale). Question: which smoother gives the best frame (smoothest $U^L$, best win) at fixed
   $\tau/t_0$, and does the ranking depend on $\beta$ (coarse vs fine)?
+
+### 1b-Stage-1 -- FLOW-TIME SCAN (ACTIVE, staged 2026-09-02; Nobu approved)
+
+First stage of 1b: fix the flow TYPE to **Wilson**, scan the frame-flow TIME, find the optimum, and test
+whether it is universal in $t_0$ units across $\beta$. $t_0$ was set (memory `project-r2-config-gen`):
+16^4 $t_0/a^2$ = 0.759 (b2.13), 1.140 (b2.25), 1.697 (b2.37), 2.91 (b2.6). Our runs SO FAR sat at
+$\tau=2$ lattice = $\tau/t_0 = 0.69$ on b2.6 only.
+
+Parameters (Nobu):
+- **$s/t_0 \in \{0.4, 0.5, 0.6, ..., 1.2\}$** (9 flow times; $s$ = frame-flow time). Per ensemble the
+  LATTICE flow time is $\tau = (s/t_0)\,t_0$, and $\mathrm{nstep} = \tau/\mathrm{eps}$ with eps $=0.02$:
+  - b2.13: $\tau$ = 0.30..0.91  (nstep 15..46)
+  - b2.25: $\tau$ = 0.46..1.37  (nstep 23..68)
+  - b2.37: $\tau$ = 0.68..2.04  (nstep 34..102)
+  - b2.6 : $\tau$ = 1.16..3.49  (nstep 58..175)
+- Flow = **Wilson** (baseline; other types are later stages of 1b).
+- **10 configs per ensemble**. 16^4 ensembles first (b2.13/2.25/2.37 have 34-37 configs; b2.6 has 35).
+  24^4 DEFERRED for this scan (only 4-9 configs, and ~5x slower per solve -> a 24^4 config's 9-tau scan
+  will not fit 12h).
+- Metric = **M0 AND M1** $D_W$-apply ratio (CGNE / FGMRES) vs $s/t_0$ (Nobu chose both). CGNE is
+  FRAME-INDEPENDENT -> compute ONCE per config, reuse for all 9 $\tau$ and both ops. **Solve tol 1e-6**
+  (Nobu; faster scan -- the RATIO is ~tol-robust, but absolute counts won't match the 1e-8 headline data).
+
+Job structure (Nobu: loop in the WRAPPER, NO array jobs, 12h):
+- The wrapper LOOPS over configs and fires a plain per-config `qsub` (10 jobs/ensemble; no `-t` array).
+- Each per-config job loads its config, runs CGNE once, then loops the 9 $\tau$: Wilson-flow to $\tau$,
+  Landau-fix -> $\Omega$, FGMRES(M0) + FGMRES(M1), print one line per $\tau$ ($s/t_0$, iters, ratios,
+  Landau). `#$ -l h_rt=12:00:00`. Est. at 16^4, tol 1e-6, M0+M1: ~9 x ~55 min + CGNE ~= 8-9 h -> fits 12h
+  (watch the coarse/off-optimum frames where FGMRES needs more iters; each $\tau$ line is flushed as it
+  finishes, so a wall still yields the completed $\tau$ points).
+
+CODE NEEDED (implement after Nobu's OK; mirrors existing CLI):
+- Expose the frame-flow time SCAN in `Test_dwf_freeprec_claude.cc`: a `--flow_nsteps <comma list>` (eps
+  fixed 0.02) so run_headline computes CGNE once then loops the frame+M0 over the list, printing one line
+  per $\tau$ (`s/t0=... tau=... M0 iters=... ratio=... landau=...`). The per-ensemble nstep list is passed
+  by the wrapper (it knows $t_0$).
+- New wrapper `grid_freeprec_flowscan_wrapper_claude.sh`: per ensemble, look up $t_0$, build the nstep
+  list, pick 10 configs (MINTRAJ/SKIP), submit the array job. Logs -> log/, `#$ -m n`, DATDIR per ensemble.
+- Output: `ratio(s/t0)` per config -> ensemble mean -> plot ratio vs $s/t_0$, one series per $\beta$;
+  identify the optimum and whether it collapses in $t_0$ units.
+
+Open choices to confirm: (i) M0-only (recommended) vs also M1; (ii) solve tol 1e-8 (as now) vs 1e-6 to
+speed the scan (the RATIO is ~tol-robust); (iii) exact 10-config selection (MINTRAJ/SKIP).
 
 ### 1c. Direct gradient-descent determination of $\Omega$
 Compare the flow+Landau frame against a DIRECT group-valued gradient-descent determination of $\Omega$

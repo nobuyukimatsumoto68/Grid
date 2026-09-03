@@ -15,10 +15,10 @@
 # Watch:   qstat -u $USER ; tail -f <OUTDIR>/gen_mpi_claude.log
 
 #$ -P qfe
-#$ -M mtsmtnbyk@gmail.com
+##$ -M mtsmtnbyk@gmail.com
 #$ -N gen_iwa16
 #$ -j y
-#$ -m beas
+##$ -m n
 #$ -l h_rt=6:00:00
 #$ -pe mpi_16_tasks_per_node 32
 

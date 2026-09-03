@@ -9,8 +9,8 @@
 # Watch:   qstat -u $USER ; tail -f grid_gen_quenched_scc_claude.log
 
 #$ -P qfe
-#$ -M nmatsum@bu.edu
-#$ -m ea
+##$ -M nmatsum@bu.edu
+##$ -m n
 #$ -j y
 #$ -N gen_iwa
 #$ -l gpus=1
