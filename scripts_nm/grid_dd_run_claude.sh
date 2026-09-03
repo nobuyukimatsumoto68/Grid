@@ -60,12 +60,12 @@ export OMP_NUM_THREADS=8
   echo "  built ${BIN}"
 
   echo "======== [2/3] G0 DD scan 8^4  m=0.1  (single rank; validation + block pattern) ========"
-  ${BIN} --grid 8.8.8.8 --mpi 1.1.1.1 --config ${CFG} --mass 0.1
+  ${BIN} --grid 8.8.8.8 --mpi 1.1.1.1 --config ${CFG} --mass 0.1 --min-core 4
   rc=$?
   echo "  (m=0.1 exit ${rc})"
 
   echo "======== [3/3] G0 DD scan 8^4  m=0.02  (light-mass point) ========"
-  ${BIN} --grid 8.8.8.8 --mpi 1.1.1.1 --config ${CFG} --mass 0.02
+  ${BIN} --grid 8.8.8.8 --mpi 1.1.1.1 --config ${CFG} --mass 0.02 --min-core 4
   rc=$?
   echo "  (m=0.02 exit ${rc})"
 

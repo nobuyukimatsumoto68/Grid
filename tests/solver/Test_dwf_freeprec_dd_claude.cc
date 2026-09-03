@@ -37,6 +37,13 @@ int main(int argc, char** argv) {
   if (GridCmdOptionExists(argv, argv + argc, "--min-core")) {
     min_core = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--min-core"));
   }
+  // FGMRES restart length. no-restart (>> expected iters) is the headline condition, but each Krylov
+  // vector is ~96 MB at 16^4 Ls8 so a no-restart basis is ~49 GB/solve -> OOM single-rank. Lower it at
+  // 16^4 (--restart) to bound memory; the block-vs-exact comparison stays fair at the same restart.
+  int fgmres_restart = 256;
+  if (GridCmdOptionExists(argv, argv + argc, "--restart")) {
+    fgmres_restart = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--restart"));
+  }
   std::vector<Complex> boundary = {1, 1, 1, -1};  // anti-periodic time
 
   Coordinate latt = GridDefaultLatt();
@@ -96,7 +103,7 @@ int main(int argc, char** argv) {
   gaussian(RNG5, bsrc);
   RealD solve_tol = 1.0e-8;
   int solve_maxit = 4000;
-  int fgmres_restart = 256;   // no-restart (RestartLength >> expected iters)
+  std::cout << "  fgmres_restart=" << fgmres_restart << std::endl;
 
   // ---- CGNE baseline ----
   MdagMLinearOperator<MobiusFermionD, LatticeFermionD> HermOp(D);
@@ -111,14 +118,19 @@ int main(int argc, char** argv) {
   std::cout << "  CGNE      : iters=" << cg_iters << "  D_W=" << dW_cgne << std::endl;
 
   // ---- exact-F FGMRES (reference) ----
-  FreeMobius5DInverse<WilsonImplD> Ffree(FGrid, Ls, M5, bb, cc, mm, boundary);
-  FreeLimitPreconditioner<WilsonImplD> M0ex(Ffree, xform, FGrid);
-  FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRESex(solve_tol, solve_maxit, M0ex,
-                                                              fgmres_restart, /*err_on_no_conv=*/false);
-  LatticeFermionD xex(FGrid);
-  xex = Zero();
-  FGMRESex(LinOp, bsrc, xex);
-  int ex_iters = FGMRESex.IterationCount;
+  // SCOPED: the FGMRES Krylov basis is ~49 GB at 16^4 no-restart; free it before the block scan
+  // allocates its own (else two coexist -> OOM on a 62 GB box).
+  int ex_iters = 0;
+  {
+    FreeMobius5DInverse<WilsonImplD> Ffree(FGrid, Ls, M5, bb, cc, mm, boundary);
+    FreeLimitPreconditioner<WilsonImplD> M0ex(Ffree, xform, FGrid);
+    FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRESex(solve_tol, solve_maxit, M0ex,
+                                                                fgmres_restart, /*err_on_no_conv=*/false);
+    LatticeFermionD xex(FGrid);
+    xex = Zero();
+    FGMRESex(LinOp, bsrc, xex);
+    ex_iters = FGMRESex.IterationCount;
+  }
   long dW_ex = (long)Ls * ex_iters;
   double ex_speed = (dW_ex > 0) ? (double)dW_cgne / (double)dW_ex : 0.0;
   std::cout << "  exact F   : FGMRES iters=" << ex_iters << "  D_W=" << dW_ex << "  => " << ex_speed

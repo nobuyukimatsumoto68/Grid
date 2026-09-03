@@ -379,7 +379,12 @@ public:
   FermionField m_in_buf;
   FermionField m_in_k;
   FermionField m_prop_k;
+  // upstream native cached FFT (merged from paboyle/Grid, e79adc9d/1cd1dc09) is the DEFAULT FFT engine:
+  // on a clean GPU it TIES/beats our FFT_claude (~2%), and its per-call pgbuf alloc is free (Grid's caching
+  // allocator pools it), so caching pgbuf bought nothing. Our old FFT_claude (m_fft) kept behind
+  // -DFREEMOBIUS5D_FFT_CLAUDE for A/B / rollback. (grid_freeprec_cost_benchmark_v2 / grid-fft-profile.)
   FFT_claude<FftScalar> m_fft;
+  PlannedFFT<typename FermionField::vector_object>* m_pfft = nullptr;   // DEFAULT (double path)
 
 #ifdef FREEMOBIUS5D_PACKONCE
   // ---- pack-once fused path (SINGLE RANK): one pack (Grid SIMD -> contiguous) + fused contiguous cuFFT
@@ -425,6 +430,7 @@ public:
   LatticeFermionF* m_prop_k_f = nullptr;
   LatticeFermionF* m_out_f = nullptr;
   FFT_claude<ComplexF>* m_fft_f = nullptr;
+  PlannedFFT<typename LatticeFermionF::vector_object>* m_pfft_f = nullptr;  // DEFAULT native cached FFT (fp32)
   Grid::Vector<ComplexF> Minv_dev_f;   // slot-indexed per FGrid_f (oSite4*Nsimd_f + lane), ComplexF
   Grid::Vector<ComplexF> btD_dev_f;     // BT-1 device (fp32), slot-indexed per FGrid_f: 16 / slot
   Grid::Vector<ComplexF> btDinv_dev_f;  // Ls*16 / slot
@@ -504,6 +510,7 @@ public:
       }
     }
     bt_gate();  // BT-0: assert block-Thomas host apply == dense Minv on a few momenta
+    m_pfft = new PlannedFFT<typename FermionField::vector_object>(FGrid);  // DEFAULT native cached FFT (double)
 
     // ---- scatter Minv into the device-resident, slot-indexed Minv_dev (Chunk 1 of the on-device
     // batched solve). Slot = oSite4*Nsimd + lane. The local 4D coord of a (oSite4, lane) is
@@ -631,6 +638,7 @@ public:
       m_prop_k_f = new LatticeFermionF(FGrid_f);
       m_out_f = new LatticeFermionF(FGrid_f);
       m_fft_f = new FFT_claude<ComplexF>(FGrid_f);
+      m_pfft_f = new PlannedFFT<typename LatticeFermionF::vector_object>(FGrid_f);  // DEFAULT native (fp32)
       precisionChange(*phase_neg_f, phase_neg);
       precisionChange(*phase_pos_f, phase_pos);
       pc_in_ws = new precisionChangeWorkspace(FGrid_f, FGrid);   // out=single(FGrid_f), in=double(FGrid)
@@ -878,7 +886,11 @@ public:
     t_phase += tp;
 
     double tf = -usecond();
-    m_fft_f->FFT_dim_mask(*m_in_k_f, *m_in_buf_f, mask, FFT::forward);
+#ifdef FREEMOBIUS5D_FFT_CLAUDE
+    m_fft_f->FFT_dim_mask(*m_in_k_f, *m_in_buf_f, mask, FFT::forward);    // our old FFT_claude (A/B / rollback)
+#else
+    m_pfft_f->FFT_dim_mask(*m_in_k_f, *m_in_buf_f, mask, FFT::forward);   // DEFAULT: native PlannedFFT
+#endif
     tf += usecond();
     t_fft_fwd += tf;
 
@@ -892,7 +904,11 @@ public:
     t_solve += ts;
 
     double tb = -usecond();
-    m_fft_f->FFT_dim_mask(*m_out_f, *m_prop_k_f, mask, FFT::backward);
+#ifdef FREEMOBIUS5D_FFT_CLAUDE
+    m_fft_f->FFT_dim_mask(*m_out_f, *m_prop_k_f, mask, FFT::backward);    // our old FFT_claude (A/B / rollback)
+#else
+    m_pfft_f->FFT_dim_mask(*m_out_f, *m_prop_k_f, mask, FFT::backward);   // DEFAULT: native PlannedFFT
+#endif
     tb += usecond();
     t_fft_bwd += tb;
 
@@ -939,8 +955,10 @@ public:
     bfft.FFT_spacetime(in_k, in_buf, FFT::forward);
 #elif defined(FREEMOBIUS5D_GRID_FFT)
     theFFT.FFT_dim_mask(in_k, in_buf, mask, FFT::forward);
+#elif defined(FREEMOBIUS5D_FFT_CLAUDE)
+    m_fft.FFT_dim_mask(in_k, in_buf, mask, FFT::forward);  // our old FFT_claude (A/B / rollback)
 #else
-    m_fft.FFT_dim_mask(in_k, in_buf, mask, FFT::forward);  // DEFAULT: cached plan/pgbuf
+    m_pfft->FFT_dim_mask(in_k, in_buf, mask, FFT::forward);  // DEFAULT: native PlannedFFT
 #endif
     tf += usecond();
     t_fft_fwd += tf;
@@ -962,8 +980,10 @@ public:
     bfft.FFT_spacetime(out, prop_k, FFT::backward);
 #elif defined(FREEMOBIUS5D_GRID_FFT)
     theFFT.FFT_dim_mask(out, prop_k, mask, FFT::backward);
+#elif defined(FREEMOBIUS5D_FFT_CLAUDE)
+    m_fft.FFT_dim_mask(out, prop_k, mask, FFT::backward);  // our old FFT_claude (A/B / rollback)
 #else
-    m_fft.FFT_dim_mask(out, prop_k, mask, FFT::backward);  // DEFAULT: cached plan/pgbuf
+    m_pfft->FFT_dim_mask(out, prop_k, mask, FFT::backward);  // DEFAULT: native PlannedFFT
 #endif
     tb += usecond();
     t_fft_bwd += tb;

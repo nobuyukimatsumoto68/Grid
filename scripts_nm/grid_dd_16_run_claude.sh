@@ -10,6 +10,10 @@
 #   then block(core=8, halo 0/1/2) vs exact -- DOES a genuinely-local block (ext 8-12 < 16) hold the win?
 # NB config is IWASAKI beta2.6 (Q!=0), not the 8^4 Wilson beta6 point -- win MAGNITUDE differs, but the
 # DD relative degradation (block vs exact) is the measurement; also probes R2 (Q-dependence).
+# MEMORY: at 16^4 Ls8 each FGMRES Krylov vector is ~96 MB, so a no-restart (256) basis is ~49 GB/solve
+# -> OOM on a 62 GB box when two coexist. Mitigated: the exact-F solve is now scoped (freed before the
+# scan) and --restart 128 bounds each basis to ~25 GB. The block-vs-exact comparison stays fair (same
+# restart). This memory pressure is itself a single-rank artifact -- G1 (MPI node=block) distributes it.
 # User runs this (heavier than 8^4); Claude reads the log. No rm, no kill here.
 
 set -u
@@ -59,7 +63,7 @@ export OMP_NUM_THREADS=8
   echo "  built ${BIN}"
 
   echo "======== [2/2] G0b 16^4 DD gate  ckpoint_lat.160 (Q=-6)  m=0.1  min-core 4 (single rank) ========"
-  ${BIN} --grid 16.16.16.16 --mpi 1.1.1.1 --config ${CFG} --mass 0.1 --min-core 4
+  ${BIN} --grid 16.16.16.16 --mpi 1.1.1.1 --config ${CFG} --mass 0.1 --min-core 8 --restart 128
   rc=$?
   echo "  (16^4 m=0.1 exit ${rc})"
 
