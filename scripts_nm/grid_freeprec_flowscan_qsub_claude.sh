@@ -25,7 +25,7 @@ module load openmpi/4.1.5_gnu-12.2.0
 ROOT=/projectnb/qfe/nmatsum/dwf
 LOGDIR=${ROOT}/log
 mkdir -p "${LOGDIR}"
-BIN=${ROOT}/build_mpi/Test_dwf_freeprec_claude
+BIN=${BIN:-${ROOT}/build_mpi_merged/Test_dwf_flowscan_claude}   # merged-tree flow-scan driver (fp32/PlannedFFT)
 GRID=${GRID:-16.16.16.16}
 CONFIG=${CONFIG:?set CONFIG=<NERSC config>}
 # NSTEPS and OPS are transported HYPHEN-joined (SGE -v splits values on commas) -> convert back to commas.
@@ -35,6 +35,8 @@ T0=${T0:-1.0}
 TOL=${TOL:-1e-6}
 OPS=${OPS:-cgne-m0-m1}
 OPS_C=$(echo "${OPS}" | tr '-' ',')
+FLOWS=${FLOWS:-wilson}
+FLOWS_C=$(echo "${FLOWS}" | tr '-' ',')
 TAG=${TAG:-$(basename "${CONFIG}")}
 OUTLOG=${OUTLOG:-${LOGDIR}/flowscan_${TAG}_claude.log}
 
@@ -47,7 +49,7 @@ if [ ! -x "${BIN}" ]; then echo "ERROR: freeprec binary missing ${BIN}"; exit 1;
 if [ ! -f "${CONFIG}" ]; then echo "ERROR: config missing ${CONFIG}"; exit 1; fi
 
 mpirun -np 1 "${BIN}" --grid "${GRID}" --mpi 1.1.1.1 --threads "${NSLOTS:-16}" \
-       --config "${CONFIG}" --ops "${OPS_C}" \
+       --config "${CONFIG}" --ops "${OPS_C}" --frame_flows "${FLOWS_C}" \
        --flow_nsteps "${NSTEPS_C}" --t0 "${T0}" --solve_tol "${TOL}" 2>&1 | tee "${OUTLOG}"
 echo "flowscan exit = ${PIPESTATUS[0]}   $(date)"
 echo "log -> ${OUTLOG}"

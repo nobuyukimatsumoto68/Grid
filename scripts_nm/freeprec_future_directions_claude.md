@@ -89,6 +89,25 @@ CODE NEEDED (implement after Nobu's OK; mirrors existing CLI):
 Open choices to confirm: (i) M0-only (recommended) vs also M1; (ii) solve tol 1e-8 (as now) vs 1e-6 to
 speed the scan (the RATIO is ~tol-robust); (iii) exact 10-config selection (MINTRAJ/SKIP).
 
+### 1b-Stage-2 -- FLOW-KERNEL scan (ACTIVE, 2026-09-03; Nobu approved)
+At a FIXED $s/t_0$ (the M0-optimum from Stage-1, or 0.4 pending), vary the flow SMOOTHER: round 1 =
+**wilson, iwasaki, anti-iwasaki** (baseline / stronger-smoothing / roughening control -- a sign test that
+"smoother frame -> better win"). Implemented in the DEDICATED driver Test_dwf_flowscan_claude.cc via
+`--frame_flows <comma list>` (swaps the flow force with `setGaugeAction(RBCGaugeAction(Nc,c1))`; $c_1$:
+Wilson 0, Symanzik $-1/12$, Iwasaki $-0.331$, DBW2 $-1.4067$, anti-Iwasaki $+0.331$). anti-Iwasaki has
+$c_0<0$ -> the flow maximizes the action and can DIVERGE -> GUARDED (skips solves + logs DIVERGED if the
+flowed plaquette is NaN/out-of-range). GPU binary built (build_merged, fp32). Submit via the flowscan
+wrapper with `FLOWS=wilson,iwasaki,antiiwasaki SOT="<fixed>"`. Metric = same M0/M1 $D_W$ ratio, now vs
+flow kernel, per $\beta$; expect Iwasaki $\gtrsim$ Wilson $\gtrsim$ anti-Iwasaki if smoothness is the lever.
+
+### 1b-Stage-3 -- STEP-SIZE scan (NEXT, after the kernel study; Nobu 2026-09-03)
+At a fixed $s/t_0$ AND fixed kernel, vary the flow integration step: a COARSE eps and a FINE eps (e.g.
+$\{0.04, 0.01\}$ vs the baseline 0.02) -- test the integration-error sensitivity of the frame (does a
+coarser/cheaper flow give an as-good frame?). CODE NEEDED: add `--flow_eps` to Test_dwf_flowscan_claude.cc
+(currently hardcoded 0.02 in main; run_flowscan already takes flow_eps) + wrapper passes EPS as
+`--flow_eps` (the wrapper's nstep = $s/t_0 \cdot t_0/$eps ALREADY uses EPS, so at fixed $s/t_0$ the LATTICE
+$\tau$ is held while nstep scales with 1/eps). Then run eps $\in \{0.04, 0.02, 0.01\}$.
+
 ### 1c. Direct gradient-descent determination of $\Omega$
 Compare the flow+Landau frame against a DIRECT group-valued gradient-descent determination of $\Omega$
 (minimize the target functional on the group manifold, no flow). Reference implementation exists in
@@ -118,6 +137,39 @@ $D_W$-corrected $M_1$:
   so this needs an honest measurement here, not an assumption either way.)
 
 ---
+
+## Direction 3 -- DOUBLE preconditioning: zMobius (MADWF) x free-limit frame (Nobu 2026-09-03)
+
+Because the target solve is VALENCE (we only want the propagator of the true $D_{DW}$, no sea
+determinant), we are free to precondition with a DIFFERENT operator as long as the outer solve targets
+the true $D_{DW}$ and a flexible solver (FGMRES) / a MADWF reconstruction makes the answer EXACT. Idea:
+stack TWO preconditioners --
+  (i) **zMobius / MADWF** (Ls-reduction): approximate the target $L_s$ operator with a cheap reduced-$L_s'$
+      zMobius (complex per-slice $b_s,c_s$ tuned to the sign function). Grid HAS this: `ZMobiusFermion`
+      (Fermion.h) + `MADWF.h` (Moebius Accelerated DWF -- reduced-$L_s'$ inner solve + exact reconstruction).
+  (ii) **free-limit frame** $M_0$/$M_1$ (gauge/spatial): our $\Omega^\dagger F \Omega$.
+-> the "double-preconditioned operator": zMobius cuts the $L_s$/chiral cost, the free frame cuts the
+gauge/spatial cost. Cost synergy (local agent's profile: $F$ = FFT 61% + dense-$(4L_s)^2$ solve 29%): a
+smaller $L_s'$ shrinks BOTH the dense-$L_s$ block and the per-slice work.
+
+TWO composition options (CONFIRM WITH NOBU which he means):
+  (a) MADWF OUTER (true Mobius $L_s{=}8$ target, inner cheap zMobius $L_s'\sim4$ solve) with the inner
+      zMobius solve PRECONDITIONED by our free-limit $M_0/M_1$.
+  (b) Replace the free kernel $F$ INSIDE $M_0$ with a reduced-$L_s'$ FREE-zMobius inverse (cheaper $M_0$
+      apply), still outer-solving the true $D_{DW}$.
+Nobu (2026-09-03): this is a TRIAL-AND-ERROR decision; leans (b), open to (a). "We can even DECREASE $L_s$
+for $M_0$" -- i.e. the reduced-$L_s'$ free kernel is the real lever, and it can be a PLAIN reduced-$L_s'$
+Mobius before even going to zMobius. KEY WRINKLE: $M_0$ preconditions $D_{DW}(L_s{=}8)$, so it must map the
+$L_s{=}8$ space to itself -- a reduced-$L_s'$ kernel cannot be applied directly; it needs an $L_s$-TRANSFER
+(chiral projection to the reduced space + reconstruction, the MADWF $P/P^{-1}$ structure). For the FREE
+kernel this transfer is ANALYTIC / FFT-diagonal -> a cheap, self-contained "FREE MADWF" preconditioner
+(no inner gauge solve, unlike (a)). Hierarchy to try (all inside $M_0$, valence-exact via flexible outer):
+  (b0) reduced-$L_s'$ PLAIN free Mobius $F$ + analytic $L_s$-transfer (simplest);
+  (b1) reduced-$L_s'$ free zMobius $F$ (complex $b_s,c_s$, better sign approx at the same $L_s'$).
+CODE: (a) wires Grid's MADWF + ZMobiusFermion with $M_0/M_1$ as the inner preconditioner; (b) generalizes
+FreeMobius5DInverse to reduced $L_s'$ + the analytic transfer (b0), then per-slice COMPLEX $b_s,c_s$ (b1) +
+$\omega_s$ tuning (Zolotarev-Remez / Yin-Mawhinney). Ref: R.C. Brower, H. Neff, K. Orginos (Mobius,
+arXiv:1206.5214); zMobius/MADWF (Yin-Mawhinney; McGlynn). PLAN before coding; measure win per variant.
 
 ## Cross-cutting: the metric for "optimal"
 Whenever we say "optimal" (flow time, flow type, direct-GD, deflation), the primary yardstick is the

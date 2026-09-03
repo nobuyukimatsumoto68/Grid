@@ -13,6 +13,7 @@ set ytics 1
 set grid ytics lc rgb "#dddddd"
 set key top right
 DAT = "freeprec_Qvsimprovement_claude.dat"
-# x = signed Q (col 4); annotate each point with its (original) plaquette (col 5), grey label above.
+# x = signed Q (col 4). M0 = blue filled square (lc 3 pt 5), M1 = red filled circle (lc 1 pt 7) --
+# distinct marker AND colour (color-blind). M1 = leading D_W correction (honest total D_W).
 plot DAT using 4:2 with points pt 5 ps 1.6 lc 3 title "free-prec (M0)", \
-     DAT using 4:2:(sprintf("plaq %.4f", $5)) with labels offset 0,0.9 font ",8" tc rgb "#555555" notitle
+     DAT using 4:6 with points pt 7 ps 1.6 lc 1 title "free-prec (M1)"

@@ -28,8 +28,10 @@ MINTRAJ=${MINTRAJ:-100}
 SKIP=${SKIP:-3}
 TOL=${TOL:-1e-6}
 OPS=${OPS:-cgne,m0,m1}          # MUST include cgne: the ratio needs the (frame-independent) baseline
+FLOWS=${FLOWS:-wilson}         # frame-flow KERNELS (comma list). Kernel scan: FLOWS=wilson,iwasaki,antiiwasaki
 DRYRUN=${DRYRUN:-0}
-OPS_T=$(echo "${OPS}" | tr ',' '-')   # hyphen transport (SGE -v splits values on commas)
+OPS_T=$(echo "${OPS}" | tr ',' '-')     # hyphen transport (SGE -v splits values on commas)
+FLOWS_T=$(echo "${FLOWS}" | tr ',' '-')
 
 [ -f "${JOBSCRIPT}" ] || { echo "ERROR: jobscript not found: ${JOBSCRIPT}"; exit 1; }
 
@@ -79,7 +81,7 @@ for L in ${VOLS}; do
     for C in ${cfgs}; do
       base=$(basename "${C}")
       tag="${base}_${L}_b${B}"
-      vars="CONFIG=${C},GRID=${GRID},NSTEPS=${nsteps},T0=${t0},TOL=${TOL},OPS=${OPS_T},TAG=${tag}"
+      vars="CONFIG=${C},GRID=${GRID},NSTEPS=${nsteps},T0=${t0},TOL=${TOL},OPS=${OPS_T},FLOWS=${FLOWS_T},TAG=${tag}"
       if [ "${DRYRUN}" = "1" ]; then
         echo "    [dryrun] qsub -N flowscan_${L}b${B//./}_${base##*.} -v ${vars} $(basename "${JOBSCRIPT}")"
       else
