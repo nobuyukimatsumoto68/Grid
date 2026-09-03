@@ -435,6 +435,11 @@ public:
     RealD t_scatter=0.0;
     RealD t_comms=0.0;
     RealD t_copy=0.0;
+
+    // Packet lifetime: posted to waited. The two directions overlap rather
+    // than nest -- bwd is still in flight across the fwd scatter -- so these
+    // use the id API and not a scoped range.
+    int fwd_trace, bwd_trace;
     
     //    std::cout << GridLogMessage << "dimension " <<dimension<<std::endl;
     //    DumpSliceNorm(std::string("Face_exchange from"),from,dimension);
@@ -462,10 +467,24 @@ public:
     int rNsimd = Nsimd / simd[dimension];
     GRID_ASSERT( buffer_size == from.Grid()->_slice_nblock[dimension]*from.Grid()->_slice_block[dimension] / simd[dimension]);
 
+    // Comms buffers: persistent, grow-only, with a large floor.  2026-08-29: with the
+    // libfabric registration cache disabled (FI_MR_CACHE_MAX_COUNT=0) every rank
+    // failed NO_TRANSLATION on the FIRST coarse-coarse exchange (7.7 KB faces from
+    // small, per-call-resized deviceVectors) while the fine stencil (shm window) and
+    // the larger L1 faces (~120 KB) registered fine.  Small hipMallocs are runtime
+    // sub-allocations; separate registrations of two of them from one pool are what
+    // a cache masks and churn later exposes (the intermittent NO_TRANSLATION/hang at
+    // NRHS>=12).  A large, never-reallocated buffer removes both the sub-allocation
+    // and the per-call realloc churn.  Hypothesis under test; the A/B is the same
+    // job with and without the cache.
     static deviceVector<vobj> send_buf; 
     static deviceVector<vobj> recv_buf;
-    send_buf.resize(buffer_size*2*depth);    
-    recv_buf.resize(buffer_size*2*depth);
+    {
+      const size_t floor_elems = (4ull*1024*1024 + sizeof(vobj)-1)/sizeof(vobj);   // >= 4 MB
+      size_t need = std::max<size_t>((size_t)buffer_size*2*depth, floor_elems);
+      if ( send_buf.size() < need ) send_buf.resize(need);
+      if ( recv_buf.size() < need ) recv_buf.resize(need);
+    }
 #ifndef ACCELERATOR_AWARE_MPI
     static hostVector<vobj> hsend_buf; 
     static hostVector<vobj> hrecv_buf;
@@ -501,6 +520,8 @@ public:
       t_gather+=usecond()-t;
 
       t=usecond();
+
+      if(d==0) fwd_trace = traceStart("PaddedCellFwdMPI");
 #ifdef ACCELERATOR_AWARE_MPI
       grid->SendToRecvFromBegin(fwd_req,
 				(void *)&send_buf[d*buffer_size], xmit_to_rank,
@@ -521,6 +542,7 @@ public:
       t_gather+= usecond() - t;
 
       t=usecond();
+      if (d==0) bwd_trace = traceStart("PaddedCellBwdMPI");
 #ifdef ACCELERATOR_AWARE_MPI
       grid->SendToRecvFromBegin(bwd_req,
 				(void *)&send_buf[(d+depth)*buffer_size], recv_from_rank,
@@ -553,6 +575,7 @@ public:
 
     t=usecond();
     grid->CommsComplete(fwd_req);
+    traceStop(fwd_trace);
 #ifndef ACCELERATOR_AWARE_MPI
     for ( int d=0;d < depth ; d ++ ) {
       acceleratorCopyToDevice(&hrecv_buf[d*buffer_size],&recv_buf[d*buffer_size],bytes);
@@ -568,6 +591,7 @@ public:
 
     t=usecond();
     grid->CommsComplete(bwd_req);
+    traceStop(bwd_trace);
 #ifndef ACCELERATOR_AWARE_MPI
     for ( int d=0;d < depth ; d ++ ) {
       acceleratorCopyToDevice(&hrecv_buf[(d+depth)*buffer_size],&recv_buf[(d+depth)*buffer_size],bytes);

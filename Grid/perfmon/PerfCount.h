@@ -93,8 +93,7 @@ inline uint64_t cyclecount(void){
 }
 #elif defined __x86_64__
 inline uint64_t cyclecount(void){ 
-  uint64_t ret = __rdtsc();
-  return (uint64_t)ret;
+  return (uint64_t)0;
 }
 #else
 
