@@ -523,7 +523,12 @@ int main(int argc, char** argv) {
   Dfree.M(Fv, DFv);
   double e2 = std::sqrt(norm2(DFv - v) / norm2(v));
 
-  bool gate1 = (e1 < 1e-10) && (e2 < 1e-10);
+#ifdef FREEMOBIUS5D_USE_FP32
+  double gtol1 = 5.0e-5;  // single-precision F apply (DEFAULT): cold gate is ~single eps, still exact-in-single
+#else
+  double gtol1 = 1.0e-10;
+#endif
+  bool gate1 = (e1 < gtol1) && (e2 < gtol1);
   std::cout << "  ||F D v - v||/||v|| = " << e1 << "   ||D F v - v||/||v|| = " << e2 << "   "
             << (gate1 ? "PASS" : "FAIL") << std::endl;
 

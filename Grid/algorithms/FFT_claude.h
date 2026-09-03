@@ -22,6 +22,15 @@ private:
   double flops_call;
   uint64_t usec;
   deviceVector<S> pgbuf;                                    // persistent pencil working buffer (grows only)
+#ifdef FFT_CLAUDE_PROFILE
+  // Internal per-FFT_dim split (device-synced). PACK = barrel-shift + pencil collect (+ Cshift comm on
+  // MPI); FFTK = cuFFT/FFTW kernel exec; UNPACK = scatter back + 1/G scale. Decides lever 1 (fp32,
+  // kernel-dominated) vs lever 2 (fuse passes, pack/unpack-dominated). Guarded -> zero cost by default.
+  mutable double tp_pack = 0.0;
+  mutable double tp_fftk = 0.0;
+  mutable double tp_unpack = 0.0;
+  mutable long np_calls = 0;
+#endif
   std::map<uint64_t, typename FFTW<S>::FFTW_plan> plans;    // cached plans keyed by (sign,G,howmany)
 
   static uint64_t plan_key(int sign, int G, int64_t howmany) {
@@ -129,6 +138,10 @@ public:
     }
 
     // ----- Barrel shift and collect global pencil (verbatim from Grid FFT_dim) -----
+#ifdef FFT_CLAUDE_PROFILE
+    accelerator_barrier();
+    double _tpk = -usecond();
+#endif
     result = source;
     int pc = grid->_processor_coor[dim];
 
@@ -189,9 +202,19 @@ public:
       }
     }
 
+#ifdef FFT_CLAUDE_PROFILE
+    accelerator_barrier();
+    tp_pack += _tpk + usecond();
+    double _tft = -usecond();
+#endif
     FFTW_scalar* in = (FFTW_scalar*)pgbuf_v;
     FFTW_scalar* out = (FFTW_scalar*)pgbuf_v;
     FFTW<scalar>::fftw_execute_dft(p, in, out, sign);
+#ifdef FFT_CLAUDE_PROFILE
+    accelerator_barrier();
+    tp_fftk += _tft + usecond();
+    double _tup = -usecond();
+#endif
 
     flops_call = 5.0 * howmany * G * log2(G);
     flops = flops_call;
@@ -235,8 +258,30 @@ public:
       });
     }
     result = result * div;
+#ifdef FFT_CLAUDE_PROFILE
+    accelerator_barrier();
+    tp_unpack += _tup + usecond();
+    np_calls++;
+#endif
     // plan NOT destroyed here -- cached in `plans`, freed in the destructor.
   }
+
+#ifdef FFT_CLAUDE_PROFILE
+  // Per-FFT_dim-call averages (one M0 apply = 8 FFT_dim calls: 4 dims x fwd+bwd, mask[0]=0).
+  void report() const {
+    if (np_calls == 0) {
+      return;
+    }
+    double n = (double)np_calls;
+    double tot = tp_pack + tp_fftk + tp_unpack;
+    std::cout << GridLogMessage << "[FFT_dim split] " << np_calls << " calls, avg us/call:" << std::endl;
+    std::cout << GridLogMessage << "  pack   " << tp_pack / n << "  (" << 100.0 * tp_pack / tot << "%)" << std::endl;
+    std::cout << GridLogMessage << "  fftk   " << tp_fftk / n << "  (" << 100.0 * tp_fftk / tot << "%)" << std::endl;
+    std::cout << GridLogMessage << "  unpack " << tp_unpack / n << "  (" << 100.0 * tp_unpack / tot << "%)" << std::endl;
+    std::cout << GridLogMessage << "  total  " << tot / n << std::endl;
+    std::cout << GridLogMessage << "  pack+unpack fraction = " << (tp_pack + tp_unpack) / tot << std::endl;
+  }
+#endif
 };
 
 }  // namespace Grid

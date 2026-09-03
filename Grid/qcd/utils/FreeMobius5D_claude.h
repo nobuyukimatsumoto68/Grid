@@ -30,9 +30,24 @@
 #include <complex>
 #include <cmath>
 #include <vector>
+#include <random>
 #include <Grid/Grid.h>
 #include <Grid/algorithms/BlockingFFT_claude.h>  // SIMD-blocking FFT (used under -DFREEMOBIUS5D_BLOCKING_FFT)
 #include <Grid/algorithms/FFT_claude.h>          // cached-plan/pgbuf FFT (DEFAULT; -DFREEMOBIUS5D_GRID_FFT = Grid's uncached)
+
+// fp32 is the DEFAULT F-apply precision (validated 1.51x, 2026-09-02; gate 3.3e-7, FGMRES iters identical
+// to double -- grid_packonce_fft_impl_plan_claude.md Chunk B). It runs the barrel pipeline in single on a
+// dedicated single-precision 5D grid; the OUTER FGMRES stays double so final accuracy is unchanged. Force
+// the double reference path with -DFREEMOBIUS5D_FP64. -DFREEMOBIUS5D_PACKONCE selects the (shelved,
+// net-loss) pack-once path instead and takes precedence.
+#if !defined(FREEMOBIUS5D_FP64) && !defined(FREEMOBIUS5D_PACKONCE)
+#define FREEMOBIUS5D_USE_FP32
+#endif
+
+// max n5 = 4*Ls for per-thread device scratch (block-Thomas + pack-once solve). Ls <= 16.
+#ifndef FREEMOBIUS5D_PO_NMAX
+#define FREEMOBIUS5D_PO_NMAX 64
+#endif
 
 namespace Grid {
 
@@ -194,6 +209,121 @@ struct FreeMobius5DBlock {
   }
 };
 
+// Device block-Thomas solve y = T^{-1} r for ONE momentum (colour vector, n5 = 4*Ls). T = D_DW(p,m=0)
+// block-tridiagonal: diag A = b D_W + I, super Uup = (c D_W - I)P_- (cols 2,3), sub Udn = (c D_W - I)P_+
+// (cols 0,1). D = D_W(p) 4x4 (row-major); Dinv = the Ls pivot inverses Delta_s^{-1} (Ls*16). cC = c as a
+// complex of the field type. Templated on the complex scalar C so it serves the double and fp32 solves.
+// Same math as block_thomas_solve_host (BT-0, gate 4.3e-16). grid_block_thomas_impl_plan_claude.md.
+template <class C>
+accelerator_inline void bt_solve_dev(int Ls, C cC, const C* D, const C* Dinv, const C* r, C* y) {
+  C one = C(1.0, 0.0);
+  C Uup[16];
+  C Udn[16];
+  for (int a = 0; a < 4; ++a) {
+    for (int a2 = 0; a2 < 4; ++a2) {
+      C hop = D[a * 4 + a2] * cC;
+      if (a == a2) {
+        hop = hop - one;
+      }
+      Uup[a * 4 + a2] = (a2 >= 2) ? hop : C(0.0, 0.0);
+      Udn[a * 4 + a2] = (a2 < 2) ? hop : C(0.0, 0.0);
+    }
+  }
+  C rho[FREEMOBIUS5D_PO_NMAX];
+  for (int k = 0; k < 4 * Ls; ++k) {
+    rho[k] = r[k];
+  }
+  // forward: rho_s -= Udn (Delta_{s-1}^{-1} rho_{s-1})
+  for (int s = 1; s < Ls; ++s) {
+    const C* Dprev = Dinv + (s - 1) * 16;
+    C t[4];
+    for (int a = 0; a < 4; ++a) {
+      C acc = C(0.0, 0.0);
+      for (int bb = 0; bb < 4; ++bb) {
+        acc = acc + Dprev[a * 4 + bb] * rho[(s - 1) * 4 + bb];
+      }
+      t[a] = acc;
+    }
+    for (int a = 0; a < 4; ++a) {
+      C acc = C(0.0, 0.0);
+      for (int bb = 0; bb < 4; ++bb) {
+        acc = acc + Udn[a * 4 + bb] * t[bb];
+      }
+      rho[s * 4 + a] = rho[s * 4 + a] - acc;
+    }
+  }
+  // backward: y_{Ls-1} = Delta_{Ls-1}^{-1} rho_{Ls-1}; y_s = Delta_s^{-1}(rho_s - Uup y_{s+1})
+  const C* Dlast = Dinv + (Ls - 1) * 16;
+  for (int a = 0; a < 4; ++a) {
+    C acc = C(0.0, 0.0);
+    for (int bb = 0; bb < 4; ++bb) {
+      acc = acc + Dlast[a * 4 + bb] * rho[(Ls - 1) * 4 + bb];
+    }
+    y[(Ls - 1) * 4 + a] = acc;
+  }
+  for (int s = Ls - 2; s >= 0; --s) {
+    C tmp[4];
+    for (int a = 0; a < 4; ++a) {
+      C acc = rho[s * 4 + a];
+      for (int bb = 0; bb < 4; ++bb) {
+        acc = acc - Uup[a * 4 + bb] * y[(s + 1) * 4 + bb];
+      }
+      tmp[a] = acc;
+    }
+    const C* Ds = Dinv + s * 16;
+    for (int a = 0; a < 4; ++a) {
+      C acc = C(0.0, 0.0);
+      for (int bb = 0; bb < 4; ++bb) {
+        acc = acc + Ds[a * 4 + bb] * tmp[bb];
+      }
+      y[s * 4 + a] = acc;
+    }
+  }
+}
+
+// Device rank-4 antiperiodic correction for ONE momentum: out = y + m T^{-1} L (I4 - m G_bt)^{-1} R y,
+// with y = T^{-1} r already computed. Cm = (I4 - m G_bt)^{-1} (4x4, precomputed). mC = m, cC = c.
+template <class C>
+accelerator_inline void bt_corner_dev(int Ls, C cC, C mC, const C* D, const C* Dinv, const C* Cm,
+                                      const C* y, C* out) {
+  C one = C(1.0, 0.0);
+  const int srcspin[4] = {2, 3, 0, 1};
+  const int tslice[4] = {Ls - 1, Ls - 1, 0, 0};
+  const int rrow[4] = {0 * 4 + 2, 0 * 4 + 3, (Ls - 1) * 4 + 0, (Ls - 1) * 4 + 1};
+  C w[4];
+  for (int i = 0; i < 4; ++i) {
+    w[i] = y[rrow[i]];
+  }
+  C sc4[4];
+  for (int a = 0; a < 4; ++a) {
+    C acc = C(0.0, 0.0);
+    for (int bb = 0; bb < 4; ++bb) {
+      acc = acc + Cm[a * 4 + bb] * w[bb];
+    }
+    sc4[a] = acc;
+  }
+  C Lvec[FREEMOBIUS5D_PO_NMAX];
+  for (int k = 0; k < 4 * Ls; ++k) {
+    Lvec[k] = C(0.0, 0.0);
+  }
+  for (int j = 0; j < 4; ++j) {
+    int spn = srcspin[j];
+    int st = tslice[j];
+    for (int a = 0; a < 4; ++a) {
+      C hop = D[a * 4 + spn] * cC;
+      if (a == spn) {
+        hop = hop - one;
+      }
+      Lvec[st * 4 + a] = Lvec[st * 4 + a] + sc4[j] * hop;
+    }
+  }
+  C z[FREEMOBIUS5D_PO_NMAX];
+  bt_solve_dev(Ls, cC, D, Dinv, Lvec, z);
+  for (int k = 0; k < 4 * Ls; ++k) {
+    out[k] = y[k] + mC * z[k];
+  }
+}
+
 // -------------------- CHUNK 1: full apply F = D_DW^free(m)^{-1} --------------------
 // Reuses Grid's DomainWallFermion::FreePropagator FFT+twist machinery VERBATIM (DomainWallFermion.h:44);
 // the ONLY substitution is the momentum-space step: Grid's Shamir MomentumSpacePropagatorHt_5d -> our
@@ -220,6 +350,17 @@ public:
   std::vector<Complex> boundary;      // e.g. {1,1,1,-1}
   int V4loc;                          // LOCAL (per-rank) 4D momentum count; keys Minv
   std::vector<Eigen::MatrixXcd> Minv; // per LOCAL 4D momentum site, precomputed block inverse (host/build ref)
+
+  // block-Thomas per-momentum solve (O(Ls) replacement for the dense Minv; peer PV+mass, algebra in
+  // grid_block_thomas_impl_plan_claude.md). BT-0 = host precompute + reference + gate vs dense Minv.
+  // Stored per LOCAL momentum idx (host, double). Device UVM copies come in BT-1.
+  std::vector<std::array<std::complex<double>, 16>> bt_D;     // D_W(p) 4x4 (row-major a*4+a2)
+  std::vector<std::vector<std::complex<double>>> bt_Dinv;     // Ls pivot inverses Delta_s^{-1} (Ls*16)
+  std::vector<std::array<std::complex<double>, 16>> bt_Cminv; // (I4 - m G_bt)^{-1} 4x4 (m fixed in F)
+  // BT-1 device (UVM, slot-indexed oSite4*Nsimd+lane, like Minv_dev): double path (fp64 / default-double).
+  Grid::Vector<Grid::Complex> btD_dev;      // 16 / slot
+  Grid::Vector<Grid::Complex> btDinv_dev;   // Ls*16 / slot
+  Grid::Vector<Grid::Complex> btCminv_dev;  // 16 / slot
   // device-resident copy of Minv for the on-device batched solve (no host round-trip). UVM (Grid::Vector
   // = uvmAllocator) so it is host-fillable and device-readable. Laid out row-major (4Ls)x(4Ls) per SITE
   // SLOT (oSite4*Nsimd + lane), NOT per idx4, so the kernel needs no coordinate math -- Build() scatters
@@ -239,6 +380,63 @@ public:
   FermionField m_in_k;
   FermionField m_prop_k;
   FFT_claude<FftScalar> m_fft;
+
+#ifdef FREEMOBIUS5D_PACKONCE
+  // ---- pack-once fused path (SINGLE RANK): one pack (Grid SIMD -> contiguous) + fused contiguous cuFFT
+  // (rank-3 xyz + rank-1 t, cached) + block solve IN the buffer + one unpack. Pays 1 pack + 1 unpack per
+  // apply instead of the barrel path's 16 layout conversions. CoreScalar = precision knob (fp32 via
+  // -DFREEMOBIUS5D_FP32). Design + the "no-free-lunch" lesson: grid_packonce_fft_impl_plan_claude.md.
+#ifdef FREEMOBIUS5D_FP32
+  typedef ComplexF CoreScalar;
+#else
+  typedef ComplexD CoreScalar;
+#endif
+#ifndef FREEMOBIUS5D_PO_NMAX
+#define FREEMOBIUS5D_PO_NMAX 64  // max n5 = 4*Ls for the solve's per-thread gather buffer (Ls <= 16)
+#endif
+  typedef typename FFTW<CoreScalar>::FFTW_plan CorePlan;
+  typedef typename FFTW<CoreScalar>::FFTW_scalar CoreFFTWScalar;
+  int po_Lx, po_Ly, po_Lz, po_Lt;      // local spacetime extents (== global, single rank)
+  int po_V4;                           // Lx*Ly*Lz*Lt
+  int po_Lzyx;                         // Lx*Ly*Lz (one t-slab)
+  int po_Ncomp;                        // Ls*4*Nc components (independent FFT batches)
+  int po_n5;                           // 4*Ls (the (s,spin) block size the solve couples)
+  deviceVector<CoreScalar> m_B;        // contiguous [comp][kt][kz][ky][kx], comp=(s*4+spin)*Nc+colour
+  // UVM (uvmAllocator) NOT deviceVector: host-filled in Build(), device-read in the solve kernel -- same
+  // reason Minv_dev is a Grid::Vector (a device-only deviceVector host-write segfaults).
+  Grid::Vector<CoreScalar> m_Minv_core;// per momentum q, n5 x n5 row-major (CoreScalar) -- keyed q==idx4
+  bool po_plans_ready = false;
+  CorePlan po_f3, po_f1, po_b3, po_b1; // cached fwd/bwd rank-3 (xyz) + rank-1 (t) plans
+#endif
+
+#ifdef FREEMOBIUS5D_USE_FP32
+  // ---- fp32 on the DEFAULT (barrel) path: precisionChange in/out to single, run phase + barrel FFT +
+  // on-device solve entirely in ComplexF. Halves the pack/unpack/solve/cuFFT bytes uniformly
+  // (layout-INDEPENDENT ~2x). The OUTER FGMRES stays double, so final accuracy is unchanged (flexible
+  // GMRES; grid_freeprec_cost_benchmark_v2_claude.md Section 10). The single grid has its OWN simd layout,
+  // so Minv_dev_f is re-scattered with FGrid_f geometry (not FGrid's). Fields are pointers (need FGrid_f,
+  // built in Build()). Single rank (matches the benchmark).
+  GridCartesian* UGrid_f = nullptr;
+  GridCartesian* FGrid_f = nullptr;
+  LatticeComplexF* phase_neg_f = nullptr;
+  LatticeComplexF* phase_pos_f = nullptr;
+  LatticeFermionF* m_in_buf_f = nullptr;
+  LatticeFermionF* m_in_k_f = nullptr;
+  LatticeFermionF* m_prop_k_f = nullptr;
+  LatticeFermionF* m_out_f = nullptr;
+  FFT_claude<ComplexF>* m_fft_f = nullptr;
+  Grid::Vector<ComplexF> Minv_dev_f;   // slot-indexed per FGrid_f (oSite4*Nsimd_f + lane), ComplexF
+  Grid::Vector<ComplexF> btD_dev_f;     // BT-1 device (fp32), slot-indexed per FGrid_f: 16 / slot
+  Grid::Vector<ComplexF> btDinv_dev_f;  // Ls*16 / slot
+  Grid::Vector<ComplexF> btCminv_dev_f; // 16 / slot
+  typedef typename LatticeFermionF::scalar_object SiteSpinorF;
+  // Precomputed precisionChange coordinate maps -- the plain precisionChange(out,in) REBUILDS this map
+  // (host loop over lSites + device alloc/copy) EVERY call (~790 us/apply for the pair). Cache once in
+  // Build(), reuse via the workspace overload. (F<->D grids differ in Nsimd -> the same-grid fast path
+  // never applies; the reshuffle itself is a cheap accelerator_for, the map-build was the cost.)
+  precisionChangeWorkspace* pc_in_ws = nullptr;   // in : FGrid (double) -> FGrid_f (single)
+  precisionChangeWorkspace* pc_out_ws = nullptr;  // out: FGrid_f (single) -> FGrid (double)
+#endif
 
   // apply-level timers (usecond, always-on; accumulate over applies -- profile the FFT vs the
   // block solve under MPI decomposition; report via report_timers()). FFT internal comm/kernel
@@ -283,6 +481,9 @@ public:
     V4loc = Ll[0] * Ll[1] * Ll[2] * Ll[3];
     FreeMobius5DBlock blk(Ls, M5, b, c, mass);
     Minv.resize(V4loc);
+    bt_D.resize(V4loc);
+    bt_Dinv.resize(V4loc);
+    bt_Cminv.resize(V4loc);
     for (int kt = 0; kt < Ll[3]; ++kt) {
       for (int kz = 0; kz < Ll[2]; ++kz) {
         for (int ky = 0; ky < Ll[1]; ++ky) {
@@ -295,10 +496,14 @@ public:
             }
             int idx = ((kt * Ll[2] + kz) * Ll[1] + ky) * Ll[0] + kx;
             Minv[idx] = blk.build_block(p).inverse();
+            std::array<std::complex<double>, 16> D;
+            blk.free_dw_p(p, D);
+            build_bt_momentum(idx, D);  // block-Thomas pivots + G_bt + Cm_inv (uses free_dw_p, same convention)
           }
         }
       }
     }
+    bt_gate();  // BT-0: assert block-Thomas host apply == dense Minv on a few momenta
 
     // ---- scatter Minv into the device-resident, slot-indexed Minv_dev (Chunk 1 of the on-device
     // batched solve). Slot = oSite4*Nsimd + lane. The local 4D coord of a (oSite4, lane) is
@@ -320,6 +525,9 @@ public:
       nOsites4 *= rdim4[mu];
     }
     Minv_dev.resize((size_t)nOsites4 * Nsimd * n5 * n5);
+    btD_dev.resize((size_t)nOsites4 * Nsimd * 16);
+    btDinv_dev.resize((size_t)nOsites4 * Nsimd * Ls * 16);
+    btCminv_dev.resize((size_t)nOsites4 * Nsimd * 16);
     for (int oSite4 = 0; oSite4 < nOsites4; ++oSite4) {
       Coordinate ocoor4(4);
       Lexicographic::CoorFromIndex(ocoor4, oSite4, rdim4);
@@ -345,8 +553,47 @@ public:
             Minv_dev[base + (size_t)r * n5 + cc] = Grid::Complex(z.real(), z.imag());
           }
         }
+        // block-Thomas per-momentum data (double), same slot
+        size_t slot = (size_t)oSite4 * Nsimd + lane;
+        for (int k = 0; k < 16; ++k) {
+          btD_dev[slot * 16 + k] = Grid::Complex(bt_D[idx4][k].real(), bt_D[idx4][k].imag());
+          btCminv_dev[slot * 16 + k] = Grid::Complex(bt_Cminv[idx4][k].real(), bt_Cminv[idx4][k].imag());
+        }
+        for (int k = 0; k < Ls * 16; ++k) {
+          btDinv_dev[slot * Ls * 16 + k] = Grid::Complex(bt_Dinv[idx4][k].real(), bt_Dinv[idx4][k].imag());
+        }
       }
     }
+
+#ifdef FREEMOBIUS5D_PACKONCE
+    // ---- pack-once geometry + a CoreScalar, momentum-keyed (q == idx4) copy of the block inverses, and
+    // the contiguous buffer. Single rank ONLY: local extents == global. comp layout (s,spin,colour) with
+    // colour fastest so the solve gathers (s,spin) at stride Nc*V4 for a fixed (spacetime, colour).
+    for (int mu = 0; mu < 5; ++mu) {
+      assert(FGrid->_processors[mu] == 1 && "FREEMOBIUS5D_PACKONCE is single-rank only");
+    }
+    po_Lx = Ll[0];
+    po_Ly = Ll[1];
+    po_Lz = Ll[2];
+    po_Lt = Ll[3];
+    po_V4 = V4loc;
+    po_Lzyx = po_Lx * po_Ly * po_Lz;
+    po_n5 = 4 * Ls;
+    assert(po_n5 <= FREEMOBIUS5D_PO_NMAX && "raise FREEMOBIUS5D_PO_NMAX for this Ls");
+    po_Ncomp = Ls * 4 * Nc;
+    m_B.resize((size_t)po_Ncomp * po_V4);
+    m_Minv_core.resize((size_t)po_V4 * po_n5 * po_n5);
+    for (int q = 0; q < po_V4; ++q) {
+      const Eigen::MatrixXcd& Mi = Minv[q];  // q == idx4 (x fastest) by construction
+      size_t base = (size_t)q * po_n5 * po_n5;
+      for (int r = 0; r < po_n5; ++r) {
+        for (int cc = 0; cc < po_n5; ++cc) {
+          std::complex<double> z = Mi(r, cc);
+          m_Minv_core[base + (size_t)r * po_n5 + cc] = CoreScalar(z.real(), z.imag());
+        }
+      }
+    }
+#endif
 
     // ---- precompute the constant twist phase fields (once). ph = sum_nu bph_nu * x_nu / L_nu, with
     // bph_nu = acos(Re boundary_nu) the anti-periodic boundary phase; s = dim 0 so spacetime is dim 1..4.
@@ -362,10 +609,313 @@ public:
     }
     phase_neg = exp(ci * ph * (-1.0));
     phase_pos = exp(ci * ph);
+
+#ifdef FREEMOBIUS5D_USE_FP32
+    // ---- fp32-default machinery: single-precision 5D grid (its OWN simd layout), single scratch fields,
+    // single phase (precisionChange from the double fields), and Minv_dev_f re-scattered with FGrid_f
+    // geometry. Minv (idx4-keyed Eigen inverses) is grid-independent -> reuse it, cast to ComplexF.
+    {
+      Coordinate latt4(4);
+      Coordinate mpi4(4);
+      for (int mu = 0; mu < 4; ++mu) {
+        latt4[mu] = FGrid->_fdimensions[mu + 1];
+        mpi4[mu] = FGrid->_processors[mu + 1];
+      }
+      Coordinate simd_f = GridDefaultSimd(4, vComplexF::Nsimd());
+      UGrid_f = SpaceTimeGrid::makeFourDimGrid(latt4, simd_f, mpi4);
+      FGrid_f = SpaceTimeGrid::makeFiveDimGrid(Ls, UGrid_f);
+      phase_neg_f = new LatticeComplexF(FGrid_f);
+      phase_pos_f = new LatticeComplexF(FGrid_f);
+      m_in_buf_f = new LatticeFermionF(FGrid_f);
+      m_in_k_f = new LatticeFermionF(FGrid_f);
+      m_prop_k_f = new LatticeFermionF(FGrid_f);
+      m_out_f = new LatticeFermionF(FGrid_f);
+      m_fft_f = new FFT_claude<ComplexF>(FGrid_f);
+      precisionChange(*phase_neg_f, phase_neg);
+      precisionChange(*phase_pos_f, phase_pos);
+      pc_in_ws = new precisionChangeWorkspace(FGrid_f, FGrid);   // out=single(FGrid_f), in=double(FGrid)
+      pc_out_ws = new precisionChangeWorkspace(FGrid, FGrid_f);  // out=double(FGrid), in=single(FGrid_f)
+
+      const int n5 = 4 * Ls;
+      const Coordinate& rdim5f = FGrid_f->_rdimensions;
+      const Coordinate& simd5f = FGrid_f->_simd_layout;
+      Coordinate rdim4f(4);
+      Coordinate simd4f(4);
+      for (int mu = 0; mu < 4; ++mu) {
+        rdim4f[mu] = rdim5f[mu + 1];
+        simd4f[mu] = simd5f[mu + 1];
+      }
+      int Nsimd_f = 1;
+      int nOsites4_f = 1;
+      for (int mu = 0; mu < 4; ++mu) {
+        Nsimd_f *= simd4f[mu];
+        nOsites4_f *= rdim4f[mu];
+      }
+      Minv_dev_f.resize((size_t)nOsites4_f * Nsimd_f * n5 * n5);
+      btD_dev_f.resize((size_t)nOsites4_f * Nsimd_f * 16);
+      btDinv_dev_f.resize((size_t)nOsites4_f * Nsimd_f * Ls * 16);
+      btCminv_dev_f.resize((size_t)nOsites4_f * Nsimd_f * 16);
+      for (int oSite4 = 0; oSite4 < nOsites4_f; ++oSite4) {
+        Coordinate ocoor4(4);
+        Lexicographic::CoorFromIndex(ocoor4, oSite4, rdim4f);
+        for (int lane = 0; lane < Nsimd_f; ++lane) {
+          Coordinate icoor4(4);
+          Lexicographic::CoorFromIndex(icoor4, lane, simd4f);
+          int lcoor4[4];
+          for (int mu = 0; mu < 4; ++mu) {
+            lcoor4[mu] = ocoor4[mu] + rdim4f[mu] * icoor4[mu];
+          }
+          int idx4 = ((lcoor4[3] * Ll[2] + lcoor4[2]) * Ll[1] + lcoor4[1]) * Ll[0] + lcoor4[0];
+          const Eigen::MatrixXcd& Mi = Minv[idx4];
+          size_t base = ((size_t)oSite4 * Nsimd_f + lane) * n5 * n5;
+          for (int r = 0; r < n5; ++r) {
+            for (int cc = 0; cc < n5; ++cc) {
+              std::complex<double> z = Mi(r, cc);
+              Minv_dev_f[base + (size_t)r * n5 + cc] = ComplexF((float)z.real(), (float)z.imag());
+            }
+          }
+          size_t slot = (size_t)oSite4 * Nsimd_f + lane;
+          for (int k = 0; k < 16; ++k) {
+            btD_dev_f[slot * 16 + k] = ComplexF((float)bt_D[idx4][k].real(), (float)bt_D[idx4][k].imag());
+            btCminv_dev_f[slot * 16 + k] = ComplexF((float)bt_Cminv[idx4][k].real(), (float)bt_Cminv[idx4][k].imag());
+          }
+          for (int k = 0; k < Ls * 16; ++k) {
+            btDinv_dev_f[slot * Ls * 16 + k] = ComplexF((float)bt_Dinv[idx4][k].real(), (float)bt_Dinv[idx4][k].imag());
+          }
+        }
+      }
+    }
+#endif
   }
+
+#ifdef FREEMOBIUS5D_PACKONCE
+  // Pack-once fused apply (SINGLE RANK). One pack (Grid SIMD -> contiguous m_B) + fused contiguous cuFFT
+  // (rank-3 xyz + rank-1 t) + block solve IN m_B + one unpack. accelerator_barrier() fences the cuFFT
+  // (default stream) against the pack/solve/unpack accelerator_for's. Timers reuse the 4 members:
+  // t_phase (phase), t_fft_fwd (pack+fwd cuFFT), t_solve (solve), t_fft_bwd (bwd cuFFT+unpack).
+  void apply_packonce(const FermionField& in, FermionField& out) {
+    FermionField& in_buf = m_in_buf;
+
+    double tp = -usecond();
+    in_buf = phase_neg * in;
+    tp += usecond();
+    t_phase += tp;
+
+    // ---- lazy cached plans (cuFFT ignores the buffer pointer until exec; created once). rank-3 (x,y,z):
+    // n={Lz,Ly,Lx}, howmany=Ncomp*Lt contiguous batches (idist=Lzyx, istride=1). rank-1 (t): per comp a
+    // batch of Lzyx t-columns (istride=Lzyx, idist=1), looped over comps with a pointer offset.
+    if (!po_plans_ready) {
+      CoreFFTWScalar* p0 = (CoreFFTWScalar*)&m_B[0];
+      int n3[3] = {po_Lz, po_Ly, po_Lx};
+      int n1[1] = {po_Lt};
+      po_f3 = FFTW<CoreScalar>::fftw_plan_many_dft(3, n3, po_Ncomp * po_Lt,
+                                                   p0, n3, 1, po_Lzyx,
+                                                   p0, n3, 1, po_Lzyx,
+                                                   FFTW_FORWARD, FFTW_ESTIMATE);
+      po_b3 = FFTW<CoreScalar>::fftw_plan_many_dft(3, n3, po_Ncomp * po_Lt,
+                                                   p0, n3, 1, po_Lzyx,
+                                                   p0, n3, 1, po_Lzyx,
+                                                   FFTW_BACKWARD, FFTW_ESTIMATE);
+      po_f1 = FFTW<CoreScalar>::fftw_plan_many_dft(1, n1, po_Lzyx,
+                                                   p0, n1, po_Lzyx, 1,
+                                                   p0, n1, po_Lzyx, 1,
+                                                   FFTW_FORWARD, FFTW_ESTIMATE);
+      po_b1 = FFTW<CoreScalar>::fftw_plan_many_dft(1, n1, po_Lzyx,
+                                                   p0, n1, po_Lzyx, 1,
+                                                   p0, n1, po_Lzyx, 1,
+                                                   FFTW_BACKWARD, FFTW_ESTIMATE);
+      po_plans_ready = true;
+    }
+
+    Coordinate rdim5 = FGrid->_rdimensions;
+    Coordinate simd5 = FGrid->_simd_layout;
+    int Lx = po_Lx;
+    int Ly = po_Ly;
+    int Lz = po_Lz;
+    int V4 = po_V4;
+    int Ncc = Nc;
+    int Nsimd = (int)FGrid->Nsimd();
+    uint64_t oS = FGrid->oSites();
+
+    // ---- PACK once: Grid SIMD field -> contiguous m_B[comp][kt][kz][ky][kx], comp=(s*4+spin)*Nc+colour.
+    double tf = -usecond();
+    {
+      autoView(in_v, in_buf, AcceleratorRead);
+      CoreScalar* Bp = &m_B[0];
+      accelerator_for(oSite5, oS, 1, {
+        Coordinate ocoor(5);
+        Lexicographic::CoorFromIndex(ocoor, oSite5, rdim5);
+        for (int lane = 0; lane < Nsimd; ++lane) {
+          Coordinate icoor(5);
+          Lexicographic::CoorFromIndex(icoor, lane, simd5);
+          int s = ocoor[0] + rdim5[0] * icoor[0];
+          int x = ocoor[1] + rdim5[1] * icoor[1];
+          int y = ocoor[2] + rdim5[2] * icoor[2];
+          int z = ocoor[3] + rdim5[3] * icoor[3];
+          int t = ocoor[4] + rdim5[4] * icoor[4];
+          int q = x + Lx * (y + Ly * (z + Lz * t));
+          SiteSpinor sp = extractLane(lane, in_v[oSite5]);
+          for (int a = 0; a < 4; ++a) {
+            for (int col = 0; col < Ncc; ++col) {
+              ComplexD zz = sp()(a)(col);
+              int comp = (s * 4 + a) * Ncc + col;
+              Bp[(size_t)comp * V4 + q] = CoreScalar(zz.real(), zz.imag());
+            }
+          }
+        }
+      });
+    }
+
+    // ---- forward FFT on m_B (fenced against the pack).
+    accelerator_barrier();
+    {
+      CoreFFTWScalar* Bp = (CoreFFTWScalar*)&m_B[0];
+      FFTW<CoreScalar>::fftw_execute_dft(po_f3, Bp, Bp, FFTW_FORWARD);
+      for (int comp = 0; comp < po_Ncomp; ++comp) {
+        CoreFFTWScalar* pc = Bp + (size_t)comp * po_Lt * po_Lzyx;
+        FFTW<CoreScalar>::fftw_execute_dft(po_f1, pc, pc, FFTW_FORWARD);
+      }
+    }
+    accelerator_barrier();
+    tf += usecond();
+    t_fft_fwd += tf;
+
+    // ---- block solve IN m_B: per (momentum q, colour), gather the n5=(4Ls) (s,spin) values at stride
+    // Nc*V4, multiply by Minv_core[q] (n5 x n5), scatter back. q == idx4 keys Minv by construction.
+    double ts = -usecond();
+    {
+      CoreScalar* Bp = &m_B[0];
+      const CoreScalar* Mp = &m_Minv_core[0];
+      int n5 = po_n5;
+      uint64_t nqc = (uint64_t)po_V4 * Ncc;
+      accelerator_for(qc, nqc, 1, {
+        int q = (int)(qc / Ncc);
+        int col = (int)(qc % Ncc);
+        const CoreScalar* M = Mp + (size_t)q * n5 * n5;
+        CoreScalar xin[FREEMOBIUS5D_PO_NMAX];
+        for (int j = 0; j < n5; ++j) {
+          int comp = j * Ncc + col;  // j = s*4+spin, so comp = (s*4+spin)*Nc + col
+          xin[j] = Bp[(size_t)comp * V4 + q];
+        }
+        for (int r = 0; r < n5; ++r) {
+          CoreScalar acc = CoreScalar(0, 0);
+          for (int k = 0; k < n5; ++k) {
+            acc = acc + M[r * n5 + k] * xin[k];
+          }
+          int comp = r * Ncc + col;
+          Bp[(size_t)comp * V4 + q] = acc;
+        }
+      });
+    }
+    ts += usecond();
+    t_solve += ts;
+
+    // ---- backward FFT on m_B (fenced), then unpack once with the 1/(Lx Ly Lz Lt) scale + phase_pos.
+    double tb = -usecond();
+    accelerator_barrier();
+    {
+      CoreFFTWScalar* Bp = (CoreFFTWScalar*)&m_B[0];
+      FFTW<CoreScalar>::fftw_execute_dft(po_b3, Bp, Bp, FFTW_BACKWARD);
+      for (int comp = 0; comp < po_Ncomp; ++comp) {
+        CoreFFTWScalar* pc = Bp + (size_t)comp * po_Lt * po_Lzyx;
+        FFTW<CoreScalar>::fftw_execute_dft(po_b1, pc, pc, FFTW_BACKWARD);
+      }
+    }
+    accelerator_barrier();
+
+    double scale = 1.0 / ((double)po_Lx * po_Ly * po_Lz * po_Lt);
+    {
+      autoView(out_v, out, AcceleratorWrite);
+      const CoreScalar* Bp = &m_B[0];
+      accelerator_for(oSite5, oS, 1, {
+        Coordinate ocoor(5);
+        Lexicographic::CoorFromIndex(ocoor, oSite5, rdim5);
+        for (int lane = 0; lane < Nsimd; ++lane) {
+          Coordinate icoor(5);
+          Lexicographic::CoorFromIndex(icoor, lane, simd5);
+          int s = ocoor[0] + rdim5[0] * icoor[0];
+          int x = ocoor[1] + rdim5[1] * icoor[1];
+          int y = ocoor[2] + rdim5[2] * icoor[2];
+          int z = ocoor[3] + rdim5[3] * icoor[3];
+          int t = ocoor[4] + rdim5[4] * icoor[4];
+          int q = x + Lx * (y + Ly * (z + Lz * t));
+          SiteSpinor w;
+          w = Zero();
+          for (int a = 0; a < 4; ++a) {
+            for (int col = 0; col < Ncc; ++col) {
+              int comp = (s * 4 + a) * Ncc + col;
+              CoreScalar v = Bp[(size_t)comp * V4 + q];
+              w()(a)(col) = ComplexD((double)v.real() * scale, (double)v.imag() * scale);
+            }
+          }
+          insertLane(lane, out_v[oSite5], w);
+        }
+      });
+    }
+    tb += usecond();
+    t_fft_bwd += tb;
+
+    double tp2 = -usecond();
+    out = out * phase_pos;
+    tp2 += usecond();
+    t_phase += tp2;
+
+    n_apply++;
+  }
+#endif
+
+#ifdef FREEMOBIUS5D_USE_FP32
+  // fp32 default apply: precisionChange to single, run the whole barrel pipeline in ComplexF, change back.
+  // Timers: t_phase (precisionChange in/out + phase), t_fft_fwd, t_solve, t_fft_bwd.
+  void apply_fp32(const FermionField& in, FermionField& out) {
+    Coordinate mask(Nd + 1, 1);
+    mask[0] = 0;
+
+    double tp = -usecond();
+    precisionChange(*m_in_buf_f, in, *pc_in_ws);  // cached workspace (no per-call map rebuild)
+    *m_in_buf_f = (*phase_neg_f) * (*m_in_buf_f);
+    tp += usecond();
+    t_phase += tp;
+
+    double tf = -usecond();
+    m_fft_f->FFT_dim_mask(*m_in_k_f, *m_in_buf_f, mask, FFT::forward);
+    tf += usecond();
+    t_fft_fwd += tf;
+
+    double ts = -usecond();
+#ifdef FREEMOBIUS5D_BLOCK_THOMAS
+    MomentumSpaceSolve_bt_dev_f(*m_prop_k_f, *m_in_k_f);   // block-Thomas (GPU LOSS; -DFREEMOBIUS5D_BLOCK_THOMAS)
+#else
+    MomentumSpaceSolve_dev_f(*m_prop_k_f, *m_in_k_f);      // dense on-device (DEFAULT; fastest on GPU)
+#endif
+    ts += usecond();
+    t_solve += ts;
+
+    double tb = -usecond();
+    m_fft_f->FFT_dim_mask(*m_out_f, *m_prop_k_f, mask, FFT::backward);
+    tb += usecond();
+    t_fft_bwd += tb;
+
+    double tp2 = -usecond();
+    *m_out_f = (*m_out_f) * (*phase_pos_f);
+    precisionChange(out, *m_out_f, *pc_out_ws);  // cached workspace (no per-call map rebuild)
+    tp2 += usecond();
+    t_phase += tp2;
+
+    n_apply++;
+  }
+#endif
 
   // out = F in = D_DW^free(m)^{-1} in
   virtual void operator()(const FermionField& in, FermionField& out) {
+#ifdef FREEMOBIUS5D_PACKONCE
+    apply_packonce(in, out);
+    return;
+#endif
+#ifdef FREEMOBIUS5D_USE_FP32
+    apply_fp32(in, out);
+    return;
+#endif
     // (a) reuse the hoisted member scratch buffers (no per-apply allocation).
     FermionField& in_buf = m_in_buf;
     FermionField& in_k = m_in_k;
@@ -397,9 +947,12 @@ public:
 
     double ts = -usecond();
 #ifdef FREEMOBIUS5D_HOST_SOLVE
-    MomentumSpaceSolve(prop_k, in_k);       // host Eigen path, A/B via -DFREEMOBIUS5D_HOST_SOLVE
+    MomentumSpaceSolve(prop_k, in_k);        // host Eigen path, A/B via -DFREEMOBIUS5D_HOST_SOLVE
+#elif defined(FREEMOBIUS5D_BLOCK_THOMAS)
+    MomentumSpaceSolve_bt_dev(prop_k, in_k); // block-Thomas O(Ls): CORRECT but a GPU LOSS (solve 2.3-5.4x
+                                             // slower -- register spill; -DFREEMOBIUS5D_BLOCK_THOMAS). CPU win.
 #else
-    MomentumSpaceSolve_dev(prop_k, in_k);   // on-device batched (default, no host round-trip)
+    MomentumSpaceSolve_dev(prop_k, in_k);    // dense on-device batched matvec (DEFAULT; fastest on GPU)
 #endif
     ts += usecond();
     t_solve += ts;
@@ -438,6 +991,9 @@ public:
     std::cout << GridLogMessage << "  fft_bwd " << t_fft_bwd / n << std::endl;
     std::cout << GridLogMessage << "  total   " << tot / n << std::endl;
     std::cout << GridLogMessage << "  FFT fraction (fwd+bwd)/total = " << (t_fft_fwd + t_fft_bwd) / tot << std::endl;
+#ifdef FFT_CLAUDE_PROFILE
+    m_fft.report();  // internal pack/fftk/unpack split -> picks lever 1 (fp32) vs lever 2 (fuse passes)
+#endif
   }
 
   void reset_timers() {
@@ -446,6 +1002,249 @@ public:
     t_solve = 0.0;
     t_fft_bwd = 0.0;
     n_apply = 0;
+  }
+
+  // ===== block-Thomas per-momentum solve (BT-0: host precompute + reference + gate) =====
+  // T = D_DW(p,m=0) block-tridiagonal; diag A = b D_W + I, super Uup = (c D_W - I)P_- (cols 2,3),
+  // sub Udn = (c D_W - I)P_+ (cols 0,1). D_DW(m) = T - m L R (rank-4 antiperiodic corner). See
+  // grid_block_thomas_impl_plan_claude.md. C = std::complex<double>.
+  void bt_uup_udn(const std::array<std::complex<double>, 16>& D,
+                  std::complex<double>* Uup, std::complex<double>* Udn) const {
+    for (int a = 0; a < 4; ++a) {
+      for (int a2 = 0; a2 < 4; ++a2) {
+        std::complex<double> hop = std::complex<double>(c, 0.0) * D[a * 4 + a2];
+        if (a == a2) {
+          hop -= std::complex<double>(1.0, 0.0);
+        }
+        Uup[a * 4 + a2] = (a2 >= 2) ? hop : std::complex<double>(0.0, 0.0);
+        Udn[a * 4 + a2] = (a2 < 2) ? hop : std::complex<double>(0.0, 0.0);
+      }
+    }
+  }
+
+  // y = T^{-1} r (O(Ls) forward + backward block sweeps; no inversion in the apply). Needs bt_D[idx],
+  // bt_Dinv[idx] set.
+  void block_thomas_solve_host(int idx, const std::complex<double>* r, std::complex<double>* y) const {
+    const int n5 = 4 * Ls;
+    std::array<std::complex<double>, 16> Uup;
+    std::array<std::complex<double>, 16> Udn;
+    bt_uup_udn(bt_D[idx], Uup.data(), Udn.data());
+    std::vector<std::complex<double>> rho(r, r + n5);
+    for (int s = 1; s < Ls; ++s) {
+      const std::complex<double>* Dprev = &bt_Dinv[idx][(s - 1) * 16];
+      std::complex<double> t[4];
+      for (int a = 0; a < 4; ++a) {
+        std::complex<double> acc(0.0, 0.0);
+        for (int bb = 0; bb < 4; ++bb) {
+          acc += Dprev[a * 4 + bb] * rho[(s - 1) * 4 + bb];
+        }
+        t[a] = acc;
+      }
+      for (int a = 0; a < 4; ++a) {
+        std::complex<double> acc(0.0, 0.0);
+        for (int bb = 0; bb < 4; ++bb) {
+          acc += Udn[a * 4 + bb] * t[bb];
+        }
+        rho[s * 4 + a] -= acc;
+      }
+    }
+    const std::complex<double>* Dlast = &bt_Dinv[idx][(Ls - 1) * 16];
+    for (int a = 0; a < 4; ++a) {
+      std::complex<double> acc(0.0, 0.0);
+      for (int bb = 0; bb < 4; ++bb) {
+        acc += Dlast[a * 4 + bb] * rho[(Ls - 1) * 4 + bb];
+      }
+      y[(Ls - 1) * 4 + a] = acc;
+    }
+    for (int s = Ls - 2; s >= 0; --s) {
+      std::complex<double> tmp[4];
+      for (int a = 0; a < 4; ++a) {
+        std::complex<double> acc = rho[s * 4 + a];
+        for (int bb = 0; bb < 4; ++bb) {
+          acc -= Uup[a * 4 + bb] * y[(s + 1) * 4 + bb];
+        }
+        tmp[a] = acc;
+      }
+      const std::complex<double>* Ds = &bt_Dinv[idx][s * 16];
+      for (int a = 0; a < 4; ++a) {
+        std::complex<double> acc(0.0, 0.0);
+        for (int bb = 0; bb < 4; ++bb) {
+          acc += Ds[a * 4 + bb] * tmp[bb];
+        }
+        y[s * 4 + a] = acc;
+      }
+    }
+  }
+
+  // Precompute per momentum: bt_D, the Ls pivot inverses bt_Dinv, and bt_Cminv = (I4 - m G_bt)^{-1}.
+  void build_bt_momentum(int idx, const std::array<std::complex<double>, 16>& D) {
+    const int n5 = 4 * Ls;
+    bt_D[idx] = D;
+    std::array<std::complex<double>, 16> Uup;
+    std::array<std::complex<double>, 16> Udn;
+    bt_uup_udn(D, Uup.data(), Udn.data());
+    std::array<std::complex<double>, 16> Amat;
+    for (int a = 0; a < 4; ++a) {
+      for (int a2 = 0; a2 < 4; ++a2) {
+        Amat[a * 4 + a2] = std::complex<double>(b, 0.0) * D[a * 4 + a2]
+                         + ((a == a2) ? std::complex<double>(1.0, 0.0) : std::complex<double>(0.0, 0.0));
+      }
+    }
+    bt_Dinv[idx].assign((size_t)Ls * 16, std::complex<double>(0.0, 0.0));
+    // Delta_0^{-1} = A^{-1}
+    Eigen::Matrix4cd A;
+    for (int a = 0; a < 4; ++a) {
+      for (int a2 = 0; a2 < 4; ++a2) {
+        A(a, a2) = Amat[a * 4 + a2];
+      }
+    }
+    Eigen::Matrix4cd Ai = A.inverse();
+    for (int a = 0; a < 4; ++a) {
+      for (int a2 = 0; a2 < 4; ++a2) {
+        bt_Dinv[idx][a * 4 + a2] = Ai(a, a2);
+      }
+    }
+    // Delta_s = A - Udn (Delta_{s-1}^{-1} Uup); store Delta_s^{-1}
+    for (int s = 1; s < Ls; ++s) {
+      const std::complex<double>* Dprev = &bt_Dinv[idx][(s - 1) * 16];
+      std::complex<double> M1[16];
+      for (int a = 0; a < 4; ++a) {
+        for (int bb = 0; bb < 4; ++bb) {
+          std::complex<double> acc(0.0, 0.0);
+          for (int kk = 0; kk < 4; ++kk) {
+            acc += Dprev[a * 4 + kk] * Uup[kk * 4 + bb];
+          }
+          M1[a * 4 + bb] = acc;
+        }
+      }
+      Eigen::Matrix4cd Delta;
+      for (int a = 0; a < 4; ++a) {
+        for (int bb = 0; bb < 4; ++bb) {
+          std::complex<double> acc = Amat[a * 4 + bb];
+          for (int kk = 0; kk < 4; ++kk) {
+            acc -= Udn[a * 4 + kk] * M1[kk * 4 + bb];
+          }
+          Delta(a, bb) = acc;
+        }
+      }
+      Eigen::Matrix4cd Di = Delta.inverse();
+      for (int a = 0; a < 4; ++a) {
+        for (int bb = 0; bb < 4; ++bb) {
+          bt_Dinv[idx][s * 16 + a * 4 + bb] = Di(a, bb);
+        }
+      }
+    }
+    // G_bt = R T^{-1} L (4x4); L column j = (c D_W[:,srcspin_j] - e) in block tslice_j; R reads rrow_i.
+    const int srcspin[4] = {2, 3, 0, 1};
+    const int tslice[4] = {Ls - 1, Ls - 1, 0, 0};
+    const int rrow[4] = {0 * 4 + 2, 0 * 4 + 3, (Ls - 1) * 4 + 0, (Ls - 1) * 4 + 1};
+    Eigen::Matrix4cd G;
+    for (int j = 0; j < 4; ++j) {
+      std::vector<std::complex<double>> Lcol(n5, std::complex<double>(0.0, 0.0));
+      int sc = srcspin[j];
+      int st = tslice[j];
+      for (int a = 0; a < 4; ++a) {
+        std::complex<double> hop = std::complex<double>(c, 0.0) * D[a * 4 + sc];
+        if (a == sc) {
+          hop -= std::complex<double>(1.0, 0.0);
+        }
+        Lcol[st * 4 + a] = hop;
+      }
+      std::vector<std::complex<double>> yj(n5, std::complex<double>(0.0, 0.0));
+      block_thomas_solve_host(idx, Lcol.data(), yj.data());
+      for (int i = 0; i < 4; ++i) {
+        G(i, j) = yj[rrow[i]];
+      }
+    }
+    // Cm_inv = (I4 - m G_bt)^{-1} (m fixed in F; m=0-safe -> I4 at m=0)
+    Eigen::Matrix4cd Cm;
+    for (int a = 0; a < 4; ++a) {
+      for (int bb = 0; bb < 4; ++bb) {
+        Cm(a, bb) = std::complex<double>(-mass, 0.0) * G(a, bb)
+                  + ((a == bb) ? std::complex<double>(1.0, 0.0) : std::complex<double>(0.0, 0.0));
+      }
+    }
+    Eigen::Matrix4cd Cmi = Cm.inverse();
+    for (int a = 0; a < 4; ++a) {
+      for (int bb = 0; bb < 4; ++bb) {
+        bt_Cminv[idx][a * 4 + bb] = Cmi(a, bb);
+      }
+    }
+  }
+
+  // Full block-Thomas apply: out = D_DW(m)^{-1} r = y + m T^{-1} L (I4 - m G_bt)^{-1} R y, y = T^{-1} r.
+  void apply_bt_host(int idx, const std::complex<double>* r, std::complex<double>* out) const {
+    const int n5 = 4 * Ls;
+    const int srcspin[4] = {2, 3, 0, 1};
+    const int tslice[4] = {Ls - 1, Ls - 1, 0, 0};
+    const int rrow[4] = {0 * 4 + 2, 0 * 4 + 3, (Ls - 1) * 4 + 0, (Ls - 1) * 4 + 1};
+    std::vector<std::complex<double>> y(n5, std::complex<double>(0.0, 0.0));
+    std::vector<std::complex<double>> z(n5, std::complex<double>(0.0, 0.0));
+    std::vector<std::complex<double>> Lvec(n5, std::complex<double>(0.0, 0.0));
+    block_thomas_solve_host(idx, r, y.data());
+    std::complex<double> w[4];
+    for (int i = 0; i < 4; ++i) {
+      w[i] = y[rrow[i]];
+    }
+    const std::complex<double>* Cmi = bt_Cminv[idx].data();
+    std::complex<double> sc4[4];
+    for (int a = 0; a < 4; ++a) {
+      std::complex<double> acc(0.0, 0.0);
+      for (int bb = 0; bb < 4; ++bb) {
+        acc += Cmi[a * 4 + bb] * w[bb];
+      }
+      sc4[a] = acc;
+    }
+    const std::array<std::complex<double>, 16>& D = bt_D[idx];
+    for (int j = 0; j < 4; ++j) {
+      int spn = srcspin[j];
+      int st = tslice[j];
+      for (int a = 0; a < 4; ++a) {
+        std::complex<double> hop = std::complex<double>(c, 0.0) * D[a * 4 + spn];
+        if (a == spn) {
+          hop -= std::complex<double>(1.0, 0.0);
+        }
+        Lvec[st * 4 + a] += sc4[j] * hop;
+      }
+    }
+    block_thomas_solve_host(idx, Lvec.data(), z.data());
+    for (int k = 0; k < n5; ++k) {
+      out[k] = y[k] + std::complex<double>(mass, 0.0) * z[k];
+    }
+  }
+
+  // BT-0 gate: block-Thomas host apply vs the dense Minv on a few momenta (random r). Must match ~eps.
+  void bt_gate() const {
+    const int n5 = 4 * Ls;
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<double> uni(-1.0, 1.0);
+    double maxrel = 0.0;
+    int ncheck = (V4loc < 4) ? V4loc : 4;
+    for (int idx = 0; idx < ncheck; ++idx) {
+      std::vector<std::complex<double>> r(n5);
+      std::vector<std::complex<double>> yb(n5);
+      for (int k = 0; k < n5; ++k) {
+        r[k] = std::complex<double>(uni(rng), uni(rng));
+      }
+      apply_bt_host(idx, r.data(), yb.data());
+      Eigen::VectorXcd rv(n5);
+      for (int k = 0; k < n5; ++k) {
+        rv(k) = r[k];
+      }
+      Eigen::VectorXcd yd = Minv[idx] * rv;
+      double num = 0.0;
+      double den = 0.0;
+      for (int k = 0; k < n5; ++k) {
+        num += std::norm(yb[k] - yd(k));
+        den += std::norm(yd(k));
+      }
+      double rel = std::sqrt(num / den);
+      if (rel > maxrel) {
+        maxrel = rel;
+      }
+    }
+    std::cout << GridLogMessage << "[BT-0 gate] block-Thomas vs dense Minv max rel err = " << maxrel
+              << (maxrel < 1e-10 ? "  PASS" : "  FAIL") << std::endl;
   }
 
   // per-momentum dense block solve (colour-blind), Minv precomputed. Gather/scatter the whole 5D field
@@ -528,6 +1327,126 @@ public:
       }
     });
   }
+
+  // BT-1 on-device block-Thomas solve (double): per (oSite4, lane, colour) gather the (s,spin) vector,
+  // apply T^{-1} + the rank-4 corner (bt_solve_dev + bt_corner_dev), scatter back. Reads O(Ls) per
+  // momentum (btD/btDinv/btCminv, slot-indexed) vs the dense (4Ls)^2 Minv -> the memory-bound win. The
+  // colour loop does read-modify-write of out_v (each colour writes only its 4 spins) to avoid an outbuf.
+  void MomentumSpaceSolve_bt_dev(FermionField& prop_k, const FermionField& in_k) const {
+    const int Lsloc = Ls;
+    const int n5 = 4 * Lsloc;
+    const int Nsimd = (int)in_k.Grid()->Nsimd();
+    const uint64_t nOsites4 = in_k.Grid()->oSites() / (uint64_t)Lsloc;
+    const Grid::Complex* D_p = &btD_dev[0];
+    const Grid::Complex* Dinv_p = &btDinv_dev[0];
+    const Grid::Complex* Cm_p = &btCminv_dev[0];
+    Grid::Complex cC(c, 0.0);
+    Grid::Complex mC(mass, 0.0);
+    autoView(in_v, in_k, AcceleratorRead);
+    autoView(out_v, prop_k, AcceleratorWrite);
+    accelerator_for(oSite4, nOsites4, 1, {
+      for (int lane = 0; lane < Nsimd; ++lane) {
+        const Grid::Complex* D = D_p + ((uint64_t)oSite4 * Nsimd + lane) * 16;
+        const Grid::Complex* Dinv = Dinv_p + ((uint64_t)oSite4 * Nsimd + lane) * Lsloc * 16;
+        const Grid::Complex* Cm = Cm_p + ((uint64_t)oSite4 * Nsimd + lane) * 16;
+        for (int col = 0; col < Nc; ++col) {
+          Grid::Complex r[FREEMOBIUS5D_PO_NMAX];
+          Grid::Complex y[FREEMOBIUS5D_PO_NMAX];
+          for (int s = 0; s < Lsloc; ++s) {
+            SiteSpinor inp = extractLane(lane, in_v[s + Lsloc * oSite4]);
+            for (int a = 0; a < 4; ++a) {
+              r[s * 4 + a] = inp()(a)(col);
+            }
+          }
+          bt_solve_dev(Lsloc, cC, D, Dinv, r, y);
+          bt_corner_dev(Lsloc, cC, mC, D, Dinv, Cm, y, r);  // r = out (reuse r as output buffer)
+          for (int s = 0; s < Lsloc; ++s) {
+            SiteSpinor w = extractLane(lane, out_v[s + Lsloc * oSite4]);
+            for (int a = 0; a < 4; ++a) {
+              w()(a)(col) = r[s * 4 + a];
+            }
+            insertLane(lane, out_v[s + Lsloc * oSite4], w);
+          }
+        }
+      }
+    });
+  }
+
+#ifdef FREEMOBIUS5D_USE_FP32
+  // Single-precision copy of MomentumSpaceSolve_dev (LatticeFermionF + Minv_dev_f). Identical math, half
+  // the bytes. Runs on FGrid_f (its own Nsimd_f); Minv_dev_f is slot-indexed for that grid.
+  void MomentumSpaceSolve_dev_f(LatticeFermionF& prop_k, const LatticeFermionF& in_k) const {
+    const int Lsloc = Ls;
+    const int n5 = 4 * Lsloc;
+    const int Nsimd = (int)in_k.Grid()->Nsimd();
+    const uint64_t nOsites4 = in_k.Grid()->oSites() / (uint64_t)Lsloc;
+    const ComplexF* Minv_p = &Minv_dev_f[0];
+    autoView(in_v, in_k, AcceleratorRead);
+    autoView(out_v, prop_k, AcceleratorWrite);
+    accelerator_for(oSite4, nOsites4, 1, {
+      for (int lane = 0; lane < Nsimd; ++lane) {
+        const ComplexF* M = Minv_p + ((uint64_t)oSite4 * Nsimd + lane) * (uint64_t)n5 * n5;
+        for (int s = 0; s < Lsloc; ++s) {
+          SiteSpinorF acc;
+          acc = Zero();
+          for (int sp = 0; sp < Lsloc; ++sp) {
+            SiteSpinorF inp = extractLane(lane, in_v[sp + Lsloc * oSite4]);
+            for (int a = 0; a < 4; ++a) {
+              for (int bb = 0; bb < 4; ++bb) {
+                ComplexF m = M[(s * 4 + a) * n5 + (sp * 4 + bb)];
+                for (int col = 0; col < Nc; ++col) {
+                  acc()(a)(col) += m * inp()(bb)(col);
+                }
+              }
+            }
+          }
+          insertLane(lane, out_v[s + Lsloc * oSite4], acc);
+        }
+      }
+    });
+  }
+
+  // BT-1 on-device block-Thomas solve (single) -- ComplexF copy of MomentumSpaceSolve_bt_dev on FGrid_f.
+  void MomentumSpaceSolve_bt_dev_f(LatticeFermionF& prop_k, const LatticeFermionF& in_k) const {
+    const int Lsloc = Ls;
+    const int n5 = 4 * Lsloc;
+    const int Nsimd = (int)in_k.Grid()->Nsimd();
+    const uint64_t nOsites4 = in_k.Grid()->oSites() / (uint64_t)Lsloc;
+    const ComplexF* D_p = &btD_dev_f[0];
+    const ComplexF* Dinv_p = &btDinv_dev_f[0];
+    const ComplexF* Cm_p = &btCminv_dev_f[0];
+    ComplexF cC((float)c, 0.0f);
+    ComplexF mC((float)mass, 0.0f);
+    autoView(in_v, in_k, AcceleratorRead);
+    autoView(out_v, prop_k, AcceleratorWrite);
+    accelerator_for(oSite4, nOsites4, 1, {
+      for (int lane = 0; lane < Nsimd; ++lane) {
+        const ComplexF* D = D_p + ((uint64_t)oSite4 * Nsimd + lane) * 16;
+        const ComplexF* Dinv = Dinv_p + ((uint64_t)oSite4 * Nsimd + lane) * Lsloc * 16;
+        const ComplexF* Cm = Cm_p + ((uint64_t)oSite4 * Nsimd + lane) * 16;
+        for (int col = 0; col < Nc; ++col) {
+          ComplexF r[FREEMOBIUS5D_PO_NMAX];
+          ComplexF y[FREEMOBIUS5D_PO_NMAX];
+          for (int s = 0; s < Lsloc; ++s) {
+            SiteSpinorF inp = extractLane(lane, in_v[s + Lsloc * oSite4]);
+            for (int a = 0; a < 4; ++a) {
+              r[s * 4 + a] = inp()(a)(col);
+            }
+          }
+          bt_solve_dev(Lsloc, cC, D, Dinv, r, y);
+          bt_corner_dev(Lsloc, cC, mC, D, Dinv, Cm, y, r);
+          for (int s = 0; s < Lsloc; ++s) {
+            SiteSpinorF w = extractLane(lane, out_v[s + Lsloc * oSite4]);
+            for (int a = 0; a < 4; ++a) {
+              w()(a)(col) = r[s * 4 + a];
+            }
+            insertLane(lane, out_v[s + Lsloc * oSite4], w);
+          }
+        }
+      }
+    });
+  }
+#endif
 };
 
 // -------------------- CHUNK 2: free-limit preconditioner M0 = Omega^dag F Omega --------------------
