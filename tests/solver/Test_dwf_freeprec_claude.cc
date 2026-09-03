@@ -243,106 +243,6 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
   }
 }
 
-// Flow-time SCAN (Direction 1b Stage 1, freeprec_future_directions_claude.md): fix flow = Wilson, scan
-// the frame-flow time. CGNE is FRAME-INDEPENDENT -> computed ONCE and reused for every tau. For each
-// nstep (tau = flow_eps*nstep) we Wilson-flow, Landau-fix the frame Omega, and record the M0 (and M1)
-// D_W-apply ratio vs s/t0 = tau/t0 (t0 measured per ensemble, memory project-r2-config-gen). One block
-// per tau, flushed as it finishes so a walltime kill still leaves the completed tau points in the log.
-static void run_flowscan(const std::string& tag, LatticeGaugeFieldD& U,
-                         GridCartesian* UGrid, GridRedBlackCartesian* UrbGrid,
-                         GridCartesian* FGrid, GridRedBlackCartesian* FrbGrid,
-                         int Ls, double M5, double bb, double cc, double mm,
-                         std::vector<Complex> boundary, double flow_eps,
-                         const std::vector<int>& nsteps, double t0,
-                         GridParallelRNG& RNG5, bool run_cgne, bool run_m0, bool run_m1,
-                         double solve_tol) {
-  std::cout << "==== flow-time scan (Wilson flow)  [" << tag << "]  t0=" << t0
-            << "  tol=" << solve_tol << " ====" << std::endl;
-
-  WilsonImplD::ImplParams Params(boundary);
-  MobiusFermionD D(U, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
-  FreeMobius5DInverse<WilsonImplD> Ffree(FGrid, Ls, M5, bb, cc, mm, boundary);
-
-  LatticeFermionD bsrc(FGrid);
-  gaussian(RNG5, bsrc);
-  int solve_maxit = 4000;
-  int fgmres_restart = 256;  // no-restart: RestartLength >> expected iters (not literally maxit; OOM)
-  NonHermitianLinearOperator<MobiusFermionD, LatticeFermionD> LinOp(D);
-
-  Real plaq0 = WilsonLoops<PeriodicGimplD>::avgPlaquette(U);
-  std::cout << "  plaq=" << plaq0 << std::endl;
-
-  // CGNE baseline depends only on D (the ORIGINAL operator), NOT the frame -> compute once, reuse.
-  long dW_cgne = 0;
-  if (run_cgne) {
-    MdagMLinearOperator<MobiusFermionD, LatticeFermionD> HermOp(D);
-    LatticeFermionD bn(FGrid);
-    D.Mdag(bsrc, bn);
-    LatticeFermionD xcg(FGrid);
-    xcg = Zero();
-    ConjugateGradient<LatticeFermionD> CG(solve_tol, solve_maxit);
-    CG(HermOp, bn, xcg);
-    int cg_iters = CG.IterationsToComplete;
-    dW_cgne = (long)2 * Ls * cg_iters;
-    std::cout << "  CGNE (frame-independent): iters=" << cg_iters << "  D_W applies=" << dW_cgne
-              << std::endl;
-  }
-
-  RealD gf_alpha = 0.1 / 16.0;  // Grid FA step is 16x too large (see run_headline); use 0.1/16
-  int gf_maxit = 1000;
-  for (size_t i = 0; i < nsteps.size(); ++i) {
-    int nstep = nsteps[i];
-    RealD tau = flow_eps * nstep;
-    RealD s_over_t0 = (t0 > 0.0) ? (tau / t0) : 0.0;
-
-    LatticeGaugeFieldD Uflowed(UGrid);
-    WilsonFlow<PeriodicGimplD> wf(flow_eps, nstep);
-    wf.smear(Uflowed, U);
-    LatticeColourMatrixD xform(UGrid);
-    FourierAcceleratedGaugeFixer<PeriodicGimplD>::SteepestDescentGaugeFix(
-        Uflowed, xform, gf_alpha, gf_maxit, 1.0e-12, 1.0e-12, /*Fourier=*/true, /*orthog=*/-1,
-        /*err_on_no_converge=*/false);
-    Real landau = 1.0 - WilsonLoops<PeriodicGimplD>::linkTrace(Uflowed);
-    Real Qflow = WilsonLoops<PeriodicGimplD>::TopologicalCharge5Li(Uflowed);
-
-    std::cout << "  ---- s/t0=" << s_over_t0 << "  tau=" << tau << "  nstep=" << nstep
-              << "  Landau=" << landau << "  Q_5Li(flowed)=" << Qflow << " ----" << std::endl;
-
-    FreeLimitPreconditioner<WilsonImplD> M0(Ffree, xform, FGrid);
-    if (run_m0) {
-      M0.n_apply = 0;
-      FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES(solve_tol, solve_maxit, M0,
-                                                                fgmres_restart, /*err_on_no_conv=*/false);
-      LatticeFermionD xg(FGrid);
-      xg = Zero();
-      FGMRES(LinOp, bsrc, xg);
-      int fg_iters = FGMRES.IterationCount;
-      long dW_fgmres = (long)Ls * fg_iters;
-      double ratio = (dW_cgne > 0 && dW_fgmres > 0) ? (double)dW_cgne / (double)dW_fgmres : 0.0;
-      std::cout << "    M0: iters=" << fg_iters << "  D_W=" << dW_fgmres << "  ratio(CGNE/M0)=" << ratio
-                << "x" << std::endl;
-    }
-    if (run_m1) {
-      LatticeGaugeFieldD UL(UGrid);
-      UL = U;
-      SU<Nc>::GaugeTransform<PeriodicGimplD>(UL, xform);  // U^L = Omega U Omega^dag
-      MobiusFermionD Dframed(UL, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
-      FreeLimitPreconditioner1<WilsonImplD> M1(Ffree, xform, Dframed, FGrid);
-      FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES1(solve_tol, solve_maxit, M1,
-                                                                 fgmres_restart, /*err_on_no_conv=*/false);
-      LatticeFermionD xg1(FGrid);
-      xg1 = Zero();
-      FGMRES1(LinOp, bsrc, xg1);
-      int fg1_iters = FGMRES1.IterationCount;
-      long dW_fgmres1 = (long)Ls * fg1_iters + (long)Ls * M1.n_dw;  // honest total (M1 not D_W-free)
-      double ratio1 = (dW_cgne > 0 && dW_fgmres1 > 0) ? (double)dW_cgne / (double)dW_fgmres1 : 0.0;
-      std::cout << "    M1: iters=" << fg1_iters << "  internal D_DW[U^L]=" << M1.n_dw
-                << "  D_W(total)=" << dW_fgmres1 << "  ratio(CGNE/M1)=" << ratio1 << "x" << std::endl;
-    }
-    std::cout.flush();
-  }
-}
-
 // 4^4 bit-exact gate: build D_W(-M5) (mass-normalized, AP-time) on the loaded config, form the dense
 // (V4*Ns*Nc)x(...) matrix, compare its eigenvalue SET (sorted) to the dwf4 reference .dat. D_W
 // eigenvalues are similarity-invariant, so the gamma basis need not match -- compare sorted sets.
@@ -658,31 +558,6 @@ int main(int argc, char** argv) {
     GridCmdOptionIntVector(GridCmdOptionPayload(argv, argv + argc, "--restart-sweep"), g_restart_sweep);
   }
 
-  // FLOW-TIME SCAN (Direction 1b Stage 1): --flow_nsteps <comma list> switches the --config headline to a
-  // tau-scan (run_flowscan: CGNE once, then flow -> Landau -> M0/M1 per tau). --t0 maps tau -> s/t0 in
-  // the printout; --solve_tol overrides the solver tolerance (Nobu: 1e-6 for the scan).
-  std::vector<int> flow_nsteps;
-  if (GridCmdOptionExists(argv, argv + argc, "--flow_nsteps")) {
-    std::string a = GridCmdOptionPayload(argv, argv + argc, "--flow_nsteps");
-    std::stringstream ss(a);
-    std::string tok;
-    while (std::getline(ss, tok, ',')) {
-      if (!tok.empty()) {
-        flow_nsteps.push_back(std::stoi(tok));
-      }
-    }
-  }
-  double scan_t0 = 1.0;
-  if (GridCmdOptionExists(argv, argv + argc, "--t0")) {
-    std::string a = GridCmdOptionPayload(argv, argv + argc, "--t0");
-    GridCmdOptionFloat(a, scan_t0);
-  }
-  double scan_tol = 1.0e-8;
-  if (GridCmdOptionExists(argv, argv + argc, "--solve_tol")) {
-    std::string a = GridCmdOptionPayload(argv, argv + argc, "--solve_tol");
-    GridCmdOptionFloat(a, scan_tol);
-  }
-
   // gate 2 (pure-gauge) + the Hot-config shakeout are config-INDEPENDENT validations. Skip BOTH for a
   // real --config run: gate 2 is already validated at 4^4, and its pure-gauge fix uses alpha=0.1 (the
   // uncorrected 16x-too-large step) which could diverge at 8^4 and spuriously fail the run. Gate 1
@@ -755,14 +630,8 @@ int main(int argc, char** argv) {
               << "  |diff|=" << std::fabs(plaqr - rheader.plaquette) << std::endl;
     bool full_spectrum = GridCmdOptionExists(argv, argv + argc, "--full-spectrum");
     gate3b = nersc_crosscheck(Ureal, evalfile, UGrid, UrbGrid, M5, boundary, full_spectrum);
-    if (!flow_nsteps.empty()) {
-      run_flowscan("NERSC SU(3) -- FLOW-TIME SCAN", Ureal, UGrid, UrbGrid, FGrid, FrbGrid,
-                   Ls, M5, bb, cc, mm, boundary, 0.02, flow_nsteps, scan_t0, RNG5,
-                   run_cgne, run_m0, run_m1, scan_tol);
-    } else {
-      run_headline("NERSC SU(3) beta6 -- HEADLINE", Ureal, UGrid, UrbGrid, FGrid, FrbGrid,
-                   Ls, M5, bb, cc, mm, boundary, 0.02, 100, RNG5, run_cgne, run_m0, run_m1);
-    }
+    run_headline("NERSC SU(3) beta6 -- HEADLINE", Ureal, UGrid, UrbGrid, FGrid, FrbGrid,
+                 Ls, M5, bb, cc, mm, boundary, 0.02, 100, RNG5, run_cgne, run_m0, run_m1);
   }
 
   bool pass = (maxerr0a < 1e-10) && (maxrel0b < 1e-4) && gate1 && gate2 && gate3b;
