@@ -34,6 +34,7 @@
 #include <Grid/Grid.h>
 #include <Grid/algorithms/BlockingFFT_claude.h>  // SIMD-blocking FFT (used under -DFREEMOBIUS5D_BLOCKING_FFT)
 #include <Grid/algorithms/FFT_claude.h>          // cached-plan/pgbuf FFT (DEFAULT; -DFREEMOBIUS5D_GRID_FFT = Grid's uncached)
+#include <Grid/algorithms/DofFFT_claude.h>       // custom radix-L DOF-payload FFT (used under -DFREEMOBIUS5D_DOFFT)
 
 // fp32 is the DEFAULT F-apply precision (validated 1.51x, 2026-09-02; gate 3.3e-7, FGMRES iters identical
 // to double -- grid_packonce_fft_impl_plan_claude.md Chunk B). It runs the barrel pipeline in single on a
@@ -431,6 +432,10 @@ public:
   LatticeFermionF* m_out_f = nullptr;
   FFT_claude<ComplexF>* m_fft_f = nullptr;
   PlannedFFT<typename LatticeFermionF::vector_object>* m_pfft_f = nullptr;  // DEFAULT native cached FFT (fp32)
+#ifdef FREEMOBIUS5D_DOFFT
+  DofFFT_claude<typename LatticeFermionF::vector_object>* m_dofft_f = nullptr;  // custom radix-L DFT (unsplit dims)
+  LatticeFermionF* m_fft_scratch_f = nullptr;  // ping-pong scratch for the per-dim hybrid FFT
+#endif
   Grid::Vector<ComplexF> Minv_dev_f;   // slot-indexed per FGrid_f (oSite4*Nsimd_f + lane), ComplexF
   Grid::Vector<ComplexF> btD_dev_f;     // BT-1 device (fp32), slot-indexed per FGrid_f: 16 / slot
   Grid::Vector<ComplexF> btDinv_dev_f;  // Ls*16 / slot
@@ -639,6 +644,10 @@ public:
       m_out_f = new LatticeFermionF(FGrid_f);
       m_fft_f = new FFT_claude<ComplexF>(FGrid_f);
       m_pfft_f = new PlannedFFT<typename LatticeFermionF::vector_object>(FGrid_f);  // DEFAULT native (fp32)
+#ifdef FREEMOBIUS5D_DOFFT
+      m_dofft_f = new DofFFT_claude<typename LatticeFermionF::vector_object>(FGrid_f);
+      m_fft_scratch_f = new LatticeFermionF(FGrid_f);
+#endif
       precisionChange(*phase_neg_f, phase_neg);
       precisionChange(*phase_pos_f, phase_pos);
       pc_in_ws = new precisionChangeWorkspace(FGrid_f, FGrid);   // out=single(FGrid_f), in=double(FGrid)
@@ -873,6 +882,32 @@ public:
 #endif
 
 #ifdef FREEMOBIUS5D_USE_FP32
+#ifdef FREEMOBIUS5D_DOFFT
+  // Hybrid 4D spatial FFT of a 5D fermion (dims 1..Nd; s=dim0 skipped): the custom radix-L DofFFT on each
+  // UNSPLIT dim (simd_layout==1 + single rank -- whole-vObj coalesced butterflies, NO pencil transpose),
+  // PlannedFFT on the SPLIT dims (which need the cross-lane transpose DofFFT does not yet do). The per-dim
+  // chain == FFT_dim_mask, matched FFTW convention -> BIT-EXACT vs the default. Ping-pongs scratch<->dest
+  // (Nd=4 dims, even -> the result lands in `dest`); src/dst stay distinct (both engines require it).
+  void dofft_hybrid_f(LatticeFermionF& dest, const LatticeFermionF& source, int sign) {
+    const Coordinate& sd = FGrid_f->_simd_layout;
+    const Coordinate& pr = FGrid_f->_processors;
+    const LatticeFermionF* src = &source;
+    LatticeFermionF* a = m_fft_scratch_f;
+    LatticeFermionF* b = &dest;
+    LatticeFermionF* dst = a;
+    for (int mu = 1; mu <= Nd; ++mu) {
+      bool unsplit = (sd[mu] == 1) && (pr[mu] == 1);
+      if (unsplit) {
+        m_dofft_f->FFT_dim(*dst, *src, mu, sign);
+      } else {
+        m_pfft_f->FFT_dim(*dst, *src, mu, sign);
+      }
+      src = dst;
+      dst = (dst == a) ? b : a;
+    }
+  }
+#endif
+
   // fp32 default apply: precisionChange to single, run the whole barrel pipeline in ComplexF, change back.
   // Timers: t_phase (precisionChange in/out + phase), t_fft_fwd, t_solve, t_fft_bwd.
   void apply_fp32(const FermionField& in, FermionField& out) {
@@ -886,7 +921,9 @@ public:
     t_phase += tp;
 
     double tf = -usecond();
-#ifdef FREEMOBIUS5D_FFT_CLAUDE
+#ifdef FREEMOBIUS5D_DOFFT
+    dofft_hybrid_f(*m_in_k_f, *m_in_buf_f, FFT::forward);                 // custom DOF-FFT (unsplit) + PlannedFFT (split)
+#elif defined(FREEMOBIUS5D_FFT_CLAUDE)
     m_fft_f->FFT_dim_mask(*m_in_k_f, *m_in_buf_f, mask, FFT::forward);    // our old FFT_claude (A/B / rollback)
 #else
     m_pfft_f->FFT_dim_mask(*m_in_k_f, *m_in_buf_f, mask, FFT::forward);   // DEFAULT: native PlannedFFT
@@ -904,7 +941,9 @@ public:
     t_solve += ts;
 
     double tb = -usecond();
-#ifdef FREEMOBIUS5D_FFT_CLAUDE
+#ifdef FREEMOBIUS5D_DOFFT
+    dofft_hybrid_f(*m_out_f, *m_prop_k_f, FFT::backward);                 // custom DOF-FFT (unsplit) + PlannedFFT (split)
+#elif defined(FREEMOBIUS5D_FFT_CLAUDE)
     m_fft_f->FFT_dim_mask(*m_out_f, *m_prop_k_f, mask, FFT::backward);    // our old FFT_claude (A/B / rollback)
 #else
     m_pfft_f->FFT_dim_mask(*m_out_f, *m_prop_k_f, mask, FFT::backward);   // DEFAULT: native PlannedFFT
