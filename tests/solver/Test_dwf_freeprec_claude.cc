@@ -67,6 +67,10 @@ public:
 // NOT restart. (Memory is the real cost of no-restart; the MG smoother-slot build is what removes it.)
 static int g_fgmres_restart = 256;
 static bool g_run_bcg = false;
+static bool g_run_rbcgne = true;  // RB-CGNE (honest baseline) -- default ON; --ops "rb"=RB-only, "cgne"=full+RB
+static int g_repeat = 1;          // --repeat N: re-solve each solve N times, report the MIN wall (single-solve wall fluctuates)
+static double g_mprec = 1.0e30;   // --mprec M: build the free-prec (M0) at DW mass M != operator mass (Tikhonov scan); 1e30 = matched
+static double g_m5prec = 1.0e30;  // --m5prec M5: build the free-prec at Wilson-kernel M5 != operator M5 (2D mass-shift scan); 1e30 = matched
 static std::vector<int> g_restart_sweep;  // if set (--restart-sweep a,b,c), FGMRES solves each back-to-back
 
 static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
@@ -109,13 +113,22 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
 
   WilsonImplD::ImplParams Params(boundary);
   MobiusFermionD D(U, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
-  FreeMobius5DInverse<WilsonImplD> Ffree(FGrid, Ls, M5, bb, cc, mm, boundary);
+  // preconditioner (free-prec) mass: --mprec M builds M0 at DW mass M != operator mm (Tikhonov scan);
+  // default (g_mprec sentinel) = matched (mm). DW has no additive renorm, so matched is "physical", but
+  // the Wilson scan showed a heavier m_prec can help (Tikhonov) -- scan to check DW.
+  double mprec = (g_mprec < 1.0e29) ? g_mprec : mm;
+  double m5prec = (g_m5prec < 1.0e29) ? g_m5prec : M5;
+  if (mprec != mm || m5prec != M5) {
+    std::cout << "  [free-prec built at m_prec=" << mprec << " (op mm=" << mm << "), M5_prec="
+              << m5prec << " (op M5=" << M5 << ")]" << std::endl;
+  }
+  FreeMobius5DInverse<WilsonImplD> Ffree(FGrid, Ls, m5prec, bb, cc, mprec, boundary);
   FreeLimitPreconditioner<WilsonImplD> M0(Ffree, xform, FGrid);
 
   LatticeFermionD bsrc(FGrid);
   gaussian(RNG5, bsrc);
   RealD solve_tol = 1.0e-8;
-  int solve_maxit = 4000;
+  int solve_maxit = 20000;  // generous headroom for small-m (m=0.01) baselines (kappa ~ 1/m)
   int fgmres_restart = 256;  // no-restart: RestartLength >> expected iters, not literally maxit (OOM)
 
   // LinOp on the ORIGINAL operator D, shared by the M0 and M1 FGMRES solves.
@@ -126,18 +139,51 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
   // computed this run (e.g. FGMRES-M1 speedup vs CGNE when only --ops m1) are taken from the prior
   // freeprec_<cfg>_claude.log. flow + Landau above always run (M0 and M1 both need Omega / U^L).
   long dW_cgne = 0;
+  long dW_rbcgne = 0;
+  double wall_rbcgne = 0.0;
   if (run_cgne) {
-    // CGNE baseline: CG on MdagM, src = Mdag b
+    // CGNE baseline (FULL, unpreconditioned): CG on MdagM, src = Mdag b. This is a SOFT baseline --
+    // production uses RB-CGNE below; keep both.
     MdagMLinearOperator<MobiusFermionD, LatticeFermionD> HermOp(D);
     LatticeFermionD bn(FGrid);
     D.Mdag(bsrc, bn);
     LatticeFermionD xcg(FGrid);
     xcg = Zero();
-    ConjugateGradient<LatticeFermionD> CG(solve_tol, solve_maxit);
+    ConjugateGradient<LatticeFermionD> CG(solve_tol, solve_maxit, /*err_on_no_conv=*/false);
     CG(HermOp, bn, xcg);
     int cg_iters = CG.IterationsToComplete;
     dW_cgne = (long)2 * Ls * cg_iters;
-    std::cout << "  CGNE:       iters=" << cg_iters << "  D_W applies=" << dW_cgne << std::endl;
+    std::cout << "  CGNE(full): iters=" << cg_iters << "  D_W applies=" << dW_cgne << std::endl;
+  }
+
+  if (g_run_rbcgne) {
+    // RB-CGNE baseline: the HONEST production competitor -- SchurRedBlack (even-odd) preconditioned,
+    // CG on the Schur-complement normal operator Mpc^dag Mpc. Same D_W-count formula 2*Ls*iters
+    // (full-lattice-Dslash-equivalents: Mpc^dag Mpc = 2 Mpc/iter, each Mpc = Meo+Moe = 1 Dslash), so the
+    // COUNT captures RB's ITERATION reduction only; RB's per-Dslash is on HALF the sites -- an extra ~2x
+    // WALL win not in the count -> report wall too. Ref: SchurRedBlack.h SchurRedBlackDiagMooeeSolve.
+    ConjugateGradient<LatticeFermionD> CGrb(solve_tol, solve_maxit, /*err_on_no_conv=*/false);
+    SchurRedBlackDiagMooeeSolve<LatticeFermionD> SchurSolver(CGrb);
+    LatticeFermionD xrb(FGrid);
+    int rb_iters = 0;
+    double tw_rb_min = 1.0e30;
+    for (int rep = 0; rep < g_repeat; ++rep) {
+      xrb = Zero();
+      double tw = -usecond();
+      SchurSolver(D, bsrc, xrb);
+      tw += usecond();
+      rb_iters = CGrb.IterationsToComplete;
+      if (tw < tw_rb_min) {
+        tw_rb_min = tw;
+      }
+      if (g_repeat > 1) {
+        std::cout << "    [rep " << rep << "] RB-CGNE iters=" << rb_iters << "  WALL=" << tw / 1.0e6 << " s" << std::endl;
+      }
+    }
+    wall_rbcgne = tw_rb_min;
+    dW_rbcgne = (long)2 * Ls * rb_iters;
+    std::cout << "  RB-CGNE:    iters=" << rb_iters << "  D_W applies=" << dW_rbcgne
+              << "  WALL(min of " << g_repeat << ")=" << tw_rb_min / 1.0e6 << " s   [honest baseline]" << std::endl;
   }
 
   if (run_m0) {
@@ -152,18 +198,42 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
       FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES(solve_tol, solve_maxit, M0,
                                                                 rl, /*err_on_no_conv=*/false);
       LatticeFermionD xg(FGrid);
-      xg = Zero();
-      double tw_fg = -usecond();
-      FGMRES(LinOp, bsrc, xg);
-      tw_fg += usecond();
-      int fg_iters = FGMRES.IterationCount;
+      int fg_iters = 0;
+      double tw_fg_min = 1.0e30;
+      for (int rep = 0; rep < g_repeat; ++rep) {
+        xg = Zero();
+        M0.reset_timers();
+        double tw = -usecond();
+        FGMRES(LinOp, bsrc, xg);
+        tw += usecond();
+        fg_iters = FGMRES.IterationCount;
+        if (tw < tw_fg_min) {
+          tw_fg_min = tw;
+        }
+        if (g_repeat > 1) {
+          std::cout << "    [rep " << rep << "] FGMRES(M0) restart=" << rl << " iters=" << fg_iters
+                    << "  WALL=" << tw / 1.0e6 << " s" << std::endl;
+        }
+      }
+      double tw_fg = tw_fg_min;
       long dW_fgmres = (long)Ls * fg_iters;
       std::cout << "  FGMRES(M0) restart=" << rl << ": iters=" << fg_iters
                 << "  M0 applies=" << M0.n_apply << "  D_W applies=" << dW_fgmres
-                << "  WALL=" << tw_fg / 1.0e6 << " s" << std::endl;
+                << "  WALL(min of " << g_repeat << ")=" << tw_fg / 1.0e6 << " s" << std::endl;
       if (dW_cgne > 0) {
         double speedup = (dW_fgmres > 0) ? (double)dW_cgne / (double)dW_fgmres : 0.0;
-        std::cout << "  D_W-apply speedup (CGNE / FGMRES-M0) = " << speedup << "x" << std::endl;
+        std::cout << "  D_W-apply speedup (CGNE-full / FGMRES-M0) = " << speedup << "x  [soft baseline]" << std::endl;
+      }
+      if (dW_rbcgne > 0) {
+        double speedup_rb = (dW_fgmres > 0) ? (double)dW_rbcgne / (double)dW_fgmres : 0.0;
+        std::cout << "  D_W-apply speedup (RB-CGNE / FGMRES-M0) = " << speedup_rb << "x  [count, M0-free]" << std::endl;
+      }
+      if (wall_rbcgne > 0.0) {
+        // The HONEST headline: wall vs RB-CGNE (the M0-free count hides M0's real cost + FGMRES O(iters^2)
+        // orthogonalization). >1 = free-prec wins in wall; <1 = loss.
+        double wall_speedup_rb = (tw_fg > 0.0) ? wall_rbcgne / tw_fg : 0.0;
+        std::cout << "  WALL speedup (RB-CGNE / FGMRES-M0) = " << wall_speedup_rb
+                  << "x  [HONEST -- >1 = free-prec wins wall]" << std::endl;
       }
     }
     // COMPLETE-PICTURE benchmark: the full M0 apply breakdown (omega / phase / fft_fwd / solve /
@@ -499,7 +569,11 @@ int main(int argc, char** argv) {
 
   const double bb = 1.5;   // headline Shamir point
   const double cc = 0.5;
-  const double mm = 0.1;
+  double mm = 0.1;  // headline mass; override with --mass (small-m bench, e.g. --mass 0.01)
+  if (GridCmdOptionExists(argv, argv + argc, "--mass")) {
+    mm = std::stod(GridCmdOptionPayload(argv, argv + argc, "--mass"));
+  }
+  std::cout << "==== headline mass m = " << mm << " ====" << std::endl;
   std::vector<Complex> boundary = {1, 1, 1, -1};  // anti-periodic time
   MobiusFermionD::ImplParams Params(boundary);
   MobiusFermionD Dfree(Umu, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
@@ -544,12 +618,27 @@ int main(int argc, char** argv) {
   if (GridCmdOptionExists(argv, argv + argc, "--ops")) {
     std::string ops = GridCmdOptionPayload(argv, argv + argc, "--ops");
     run_cgne = (ops.find("cgne") != std::string::npos);
+    // RB-CGNE: "rb" runs it ALONE (skip the expensive full CGNE -- key at 16^4 small-m); "cgne" runs BOTH.
+    // "rb" is not a substring of "cgne" (and vice versa), so the two flags are independent.
+    g_run_rbcgne = (ops.find("rb") != std::string::npos) || run_cgne;
     run_m0 = (ops.find("m0") != std::string::npos);
     run_m1 = (ops.find("m1") != std::string::npos);
     g_run_bcg = (ops.find("bcg") != std::string::npos);  // BiCGSTAB(M0) A/B vs FGMRES
   }
   // outer-solver knob: --restart N sets the FGMRES restart length (default 256 = no-restart). Lower N
   // caps the O(iters^2) orthogonalization at the cost of possibly more iterations.
+  if (GridCmdOptionExists(argv, argv + argc, "--repeat")) {
+    g_repeat = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--repeat"));
+    if (g_repeat < 1) {
+      g_repeat = 1;
+    }
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--mprec")) {
+    g_mprec = std::stod(GridCmdOptionPayload(argv, argv + argc, "--mprec"));
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--m5prec")) {
+    g_m5prec = std::stod(GridCmdOptionPayload(argv, argv + argc, "--m5prec"));
+  }
   if (GridCmdOptionExists(argv, argv + argc, "--restart")) {
     g_fgmres_restart = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--restart"));
   }

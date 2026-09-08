@@ -58,6 +58,10 @@ private:
   RealD evalMaxApprox;          // running estimate of the spectral radius (max |Ritz|), for the resid test
 
 public:
+  // A2 (Cause 3): full reorthonormalization of the retained basis after each restart. The unitary
+  // rotation V <- V Q preserves orthonormality only up to rounding, and non-normal Arnoldi leaks faster
+  // than Lanczos. Default on; the driver may disable for speed. See grid_ira_faber_impl_plan_claude.md.
+  bool full_reorth = true;
 
   ImplicitlyRestartedArnoldi(LinearFunction<Field>& Op,
                              int _Nstop,
@@ -89,7 +93,7 @@ public:
 
   // Order the Ritz values WANTED-first per sortcrit. Sort on (key, index) pairs (no lambda): key is the
   // modulus for smallest-modulus, or its negative for largest-modulus, so ascending sort puts WANTED first.
-  std::vector<int> rank_ritz(const std::vector<ComplexD>& theta) const {
+  std::vector<int> rank_ritz(const std::vector<std::complex<double> >& theta) const {
     int n = (int)theta.size();
     std::vector<std::pair<double, int> > key(n);
     for (int i = 0; i < n; ++i) {
@@ -103,6 +107,55 @@ public:
       idx[i] = key[i].second;
     }
     return idx;
+  }
+
+  // A3 (Cause 2): Leja ordering of the exact shifts. Applying the p unwanted Ritz values as shifted-QR
+  // shifts is forward-unstable when successive shifts nearly collide (Watkins 1995). Leja ordering picks
+  // each next shift to MAXIMIZE the product of distances to those already chosen (greedy, via sum of
+  // logs to avoid overflow) -> shifts are maximally spread -> stable filter (Baglama-Calvetti-Reichel).
+  std::vector<int> leja_order(const std::vector<std::complex<double> >& s) const {
+    int p = (int)s.size();
+    std::vector<int> ord;
+    if (p == 0) {
+      return ord;
+    }
+    std::vector<char> used(p, 0);
+    int first = 0;
+    double bm = -1.0;
+    for (int i = 0; i < p; ++i) {
+      double m = std::sqrt(s[i].real() * s[i].real() + s[i].imag() * s[i].imag());
+      if (m > bm) {
+        bm = m;
+        first = i;
+      }
+    }
+    ord.push_back(first);
+    used[first] = 1;
+    for (int k = 1; k < p; ++k) {
+      int best = -1;
+      double bestval = -1.0e300;
+      for (int i = 0; i < p; ++i) {
+        if (used[i]) {
+          continue;
+        }
+        double logprod = 0.0;
+        for (size_t j = 0; j < ord.size(); ++j) {
+          std::complex<double> diff = s[i] - s[ord[j]];
+          double d = std::sqrt(diff.real() * diff.real() + diff.imag() * diff.imag());
+          if (d < 1.0e-300) {
+            d = 1.0e-300;
+          }
+          logprod += std::log(d);
+        }
+        if (logprod > bestval) {
+          bestval = logprod;
+          best = i;
+        }
+      }
+      ord.push_back(best);
+      used[best] = 1;
+    }
+    return ord;
   }
 
   /* Saad, "Numerical Methods for Large Eigenvalue Problems", Arnoldi (Alg. 6.1):
@@ -120,8 +173,8 @@ public:
 
     for (int i = 0; i <= k; ++i) {
       ComplexD hik = innerProduct(evec[i], w);
-      H(i, k) = hik;
-      w = w - hik * evec[i];
+      H(i, k) = std::complex<double>(real(hik), imag(hik));
+      axpy(w, -hik, evec[i], w);
     }
     // second pass (reorthogonalization); fold the correction into H(i,k)
     for (int i = 0; i <= k; ++i) {
@@ -140,7 +193,7 @@ public:
     w = w * (1.0 / beta);
 
     if (k < Nm - 1) {
-      H(k + 1, k) = ComplexD(beta, 0.0);
+      H(k + 1, k) = std::complex<double>(beta, 0.0);
       evec[k + 1] = w;
     } else {
       beta_m = beta;
@@ -152,7 +205,7 @@ public:
   void implicit_restart(std::vector<Field>& evec, Field& f) {
     // Ritz values of the full Nm Hessenberg (values only)
     Eigen::ComplexEigenSolver<Eigen::MatrixXcd> es(H, false);
-    std::vector<ComplexD> theta(Nm);
+    std::vector<std::complex<double> > theta(Nm);
     evalMaxApprox = 0.0;
     for (int i = 0; i < Nm; ++i) {
       theta[i] = es.eigenvalues()(i);
@@ -163,10 +216,17 @@ public:
     }
     std::vector<int> idx = rank_ritz(theta);  // WANTED = idx[0..Nk-1], UNWANTED = idx[Nk..Nm-1] as shifts
 
+    // A3: collect the p unwanted Ritz values as exact shifts and apply them in LEJA order (Cause 2).
+    std::vector<std::complex<double> > shifts;
+    for (int j = Nk; j < Nm; ++j) {
+      shifts.push_back(theta[idx[j]]);
+    }
+    std::vector<int> lo = leja_order(shifts);
+
     Eigen::MatrixXcd Qacc = Eigen::MatrixXcd::Identity(Nm, Nm);
     Eigen::MatrixXcd Id = Eigen::MatrixXcd::Identity(Nm, Nm);
-    for (int j = Nk; j < Nm; ++j) {
-      ComplexD mu = theta[idx[j]];
+    for (int t = 0; t < (int)lo.size(); ++t) {
+      std::complex<double> mu = shifts[lo[t]];
       Eigen::MatrixXcd Hs = H - mu * Id;
       Eigen::HouseholderQR<Eigen::MatrixXcd> qr(Hs);
       Eigen::MatrixXcd Q = qr.householderQ();
@@ -178,7 +238,7 @@ public:
     for (int i = 0; i < Nm; ++i) {
       for (int j = 0; j < Nm; ++j) {
         if (i > j + 1) {
-          H(i, j) = ComplexD(0.0, 0.0);
+          H(i, j) = std::complex<double>(0.0, 0.0);
         }
       }
     }
@@ -192,24 +252,56 @@ public:
     // Compressed residual (ARPACK):  f_new = v_{k+1}^+ beta_k^+ + f sigma,
     //   beta_k^+ = H^+(Nk, Nk-1)   (subdiagonal at the k boundary after restart),
     //   sigma    = Qacc(Nm-1, Nk-1) = e_m^\dagger Q e_k.
-    ComplexD betak = H(Nk, Nk - 1);
-    ComplexD sigma = Qacc(Nm - 1, Nk - 1);
+    std::complex<double> betak = H(Nk, Nk - 1);
+    std::complex<double> sigma = Qacc(Nm - 1, Nk - 1);
     Field fnew(f.Grid());
-    fnew = evec[Nk] * betak + f * sigma;
+    ComplexD betak_g(betak.real(), betak.imag());
+    ComplexD sigma_g(sigma.real(), sigma.imag());
+    fnew = Zero();
+    axpy(fnew, betak_g, evec[Nk], fnew);
+    axpy(fnew, sigma_g, f, fnew);
     f = fnew;
+
+    // A1 (Cause 3): DGKS-reorthogonalize the compressed residual f against the retained basis V_{Nk}
+    // (two passes). Rounding in V<-VQ and the residual compression leaks a small V^dag f != 0 that
+    // violates the Arnoldi relation A V = V H + f e^dag and compounds over restarts.
+    for (int pass = 0; pass < 2; ++pass) {
+      for (int i = 0; i < Nk; ++i) {
+        ComplexD o = innerProduct(evec[i], f);
+        axpy(f, -o, evec[i], f);
+      }
+    }
+
+    // A2 (Cause 3): periodically re-orthonormalize the rotated retained basis (MGS); the correction is
+    // rounding-level so H = V^dag A V is left unchanged (the O(eps) inconsistency is far below the drift
+    // being cured). Then re-clean f against the freshened basis.
+    if (full_reorth) {
+      for (int i = 0; i < Nk; ++i) {
+        for (int j = 0; j < i; ++j) {
+          ComplexD o = innerProduct(evec[j], evec[i]);
+          axpy(evec[i], -o, evec[j], evec[i]);
+        }
+        RealD nn = std::sqrt(norm2(evec[i]));
+        evec[i] = evec[i] * (1.0 / nn);
+      }
+      for (int i = 0; i < Nk; ++i) {
+        ComplexD o = innerProduct(evec[i], f);
+        axpy(f, -o, evec[i], f);
+      }
+    }
 
     // Fold the residual norm into the retained factorization (phase absorbed into v_{Nk}); this is the
     // coupling H(Nk, Nk-1) for the next extension, exactly as Grid's Lanczos sets lme[k2-1] = beta_k.
     RealD bk = normalise(f);
     evec[Nk] = f;
-    H(Nk, Nk - 1) = ComplexD(bk, 0.0);
+    H(Nk, Nk - 1) = std::complex<double>(bk, 0.0);
     beta_m = bk;
   }
 
   // Count converged WANTED pairs of the retained Nk-block. Ritz residual estimate for pair (theta_i, y_i)
   // of H_Nk is beta_m * |y_i(Nk-1)| (last eigenvector component), no A-applies. Returns Nconv and, if
   // want_output, also fills eval2/evec2y with the sorted Nk-block Ritz values and eigenvectors.
-  int test_convergence(std::vector<ComplexD>& eval2, Eigen::MatrixXcd& Yblock, std::vector<int>& idxk) {
+  int test_convergence(std::vector<std::complex<double> >& eval2, Eigen::MatrixXcd& Yblock, std::vector<int>& idxk) {
     Eigen::MatrixXcd Hk = H.topLeftCorner(Nk, Nk);
     Eigen::ComplexEigenSolver<Eigen::MatrixXcd> es(Hk, true);
 
@@ -234,6 +326,27 @@ public:
       }
     }
     return nconv;
+  }
+
+  // Build a single Nm-step Arnoldi factorization from src and return ALL Nm Ritz values (eigenvalues of
+  // the full Hessenberg). Used to estimate the spectrum boundary (bulk extent) for the Faber/Chebyshev
+  // ellipse fit -- no restart, no convergence test. Cheap: Nm A-applies once.
+  void ritz_estimate(const Field& src, std::vector<ComplexD>& allritz) {
+    GridBase* grid = src.Grid();
+    H = Eigen::MatrixXcd::Zero(Nm, Nm);
+    beta_m = 0.0;
+    std::vector<Field> ev(Nm + 1, Field(grid));
+    Field f(grid);
+    ev[0] = src;
+    normalise(ev[0]);
+    for (int k = 0; k < Nm; ++k) {
+      step(ev, f, k);
+    }
+    Eigen::ComplexEigenSolver<Eigen::MatrixXcd> es(H, false);
+    allritz.resize(Nm);
+    for (int i = 0; i < Nm; ++i) {
+      allritz[i] = ComplexD(es.eigenvalues()(i).real(), es.eigenvalues()(i).imag());
+    }
   }
 
   // Main driver, mirroring Grid's ImplicitlyRestartedLanczos::calc().
@@ -268,7 +381,7 @@ public:
       step(evec, f, k);
     }
 
-    std::vector<ComplexD> eval2;
+    std::vector<std::complex<double> > eval2;
     Eigen::MatrixXcd Yblock;
     std::vector<int> idxk;
 
@@ -316,9 +429,9 @@ public:
     Field Ax(grid);
     Field r(grid);
     for (int s = 0; s < Nstop; ++s) {
-      eval[s] = eval2[idxk[s]];
+      eval[s] = ComplexD(eval2[idxk[s]].real(), eval2[idxk[s]].imag());
       _Op(evec[s], Ax);
-      r = Ax - eval[s] * evec[s];
+      axpy(r, -eval[s], evec[s], Ax);
       RealD rn = std::sqrt(norm2(r));
       std::cout << GridLogMessage << " IRA eval[" << std::setw(3) << s << "] = " << eval[s]
                 << "   ||A x - lambda x|| = " << rn << std::endl;

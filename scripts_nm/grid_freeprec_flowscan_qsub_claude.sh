@@ -33,6 +33,7 @@ NSTEPS=${NSTEPS:?set NSTEPS=<hyphen list of flow nsteps, e.g. 58-73-87>}
 NSTEPS_C=$(echo "${NSTEPS}" | tr '-' ',')
 T0=${T0:-1.0}
 TOL=${TOL:-1e-6}
+EPS=${EPS:-0.02}          # RK3 flow step (step-size study); single value per job
 OPS=${OPS:-cgne-m0-m1}
 OPS_C=$(echo "${OPS}" | tr '-' ',')
 FLOWS=${FLOWS:-wilson}
@@ -50,6 +51,6 @@ if [ ! -f "${CONFIG}" ]; then echo "ERROR: config missing ${CONFIG}"; exit 1; fi
 
 mpirun -np 1 "${BIN}" --grid "${GRID}" --mpi 1.1.1.1 --threads "${NSLOTS:-16}" \
        --config "${CONFIG}" --ops "${OPS_C}" --frame_flows "${FLOWS_C}" \
-       --flow_nsteps "${NSTEPS_C}" --t0 "${T0}" --solve_tol "${TOL}" 2>&1 | tee "${OUTLOG}"
+       --flow_nsteps "${NSTEPS_C}" --flow_eps "${EPS}" --t0 "${T0}" --solve_tol "${TOL}" 2>&1 | tee "${OUTLOG}"
 echo "flowscan exit = ${PIPESTATUS[0]}   $(date)"
 echo "log -> ${OUTLOG}"

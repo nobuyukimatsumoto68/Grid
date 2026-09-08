@@ -22,7 +22,7 @@ JOBSCRIPT=${JOBSCRIPT:-${SNM}/grid_freeprec_flowscan_qsub_claude.sh}
 VOLS=${VOLS:-"16"}
 BETAS=${BETAS:-"2.13 2.25 2.37 2.6"}
 SOT=${SOT:-"0.4 0.5 0.6 0.7 0.8 0.9 1.0 1.1 1.2"}
-EPS=${EPS:-0.02}
+EPS=${EPS:-0.02}               # RK3 flow step(s). Step-size study: EPS="0.04 0.02 0.01" (a LIST) at fixed SOT
 NCFG=${NCFG:-10}
 MINTRAJ=${MINTRAJ:-100}
 SKIP=${SKIP:-3}
@@ -64,30 +64,41 @@ for L in ${VOLS}; do
       echo "  [skip] no config dir ${cdir}"
       continue
     fi
-    # build the nstep list from the s/t0 grid and this ensemble's t0 (HYPHEN-joined for SGE -v transport)
-    nsteps=""
-    for r in ${SOT}; do
-      ns=$(awk -v r="${r}" -v t="${t0}" -v e="${EPS}" 'BEGIN{printf "%d", r*t/e + 0.5}')
-      nsteps="${nsteps:+${nsteps}-}${ns}"
-    done
-    # pick NCFG configs: trajectory >= MINTRAJ, every SKIPth, take the first NCFG
+    # pick NCFG configs (eps-independent): trajectory >= MINTRAJ, every SKIPth, take the first NCFG
     cfgs=$(ls ${cdir}/ckpoint_lat.* 2>/dev/null \
            | while read f; do n=${f##*.}; [ "${n}" -ge "${MINTRAJ}" ] 2>/dev/null && echo "${n} ${f}"; done \
            | sort -n \
            | awk -v s="${SKIP}" '(NR-1) % s == 0 {print $2}' \
            | head -n "${NCFG}")
     nc=$(echo ${cfgs} | wc -w)
-    echo "  == ${L}^4 b${B}  t0=${t0}  nsteps=${nsteps}  -> ${nc} configs =="
-    for C in ${cfgs}; do
-      base=$(basename "${C}")
-      tag="${base}_${L}_b${B}"
-      vars="CONFIG=${C},GRID=${GRID},NSTEPS=${nsteps},T0=${t0},TOL=${TOL},OPS=${OPS_T},FLOWS=${FLOWS_T},TAG=${tag}"
-      if [ "${DRYRUN}" = "1" ]; then
-        echo "    [dryrun] qsub -N flowscan_${L}b${B//./}_${base##*.} -v ${vars} $(basename "${JOBSCRIPT}")"
-      else
-        jid=$(qsub -N "flowscan_${L}b${B//./}_${base##*.}" -terse -v "${vars}" "${JOBSCRIPT}" | tr -d '[:space:]')
-        echo "    submitted ${tag} -> job ${jid}"
-      fi
+    neps=$(echo ${EPS} | wc -w)
+    # loop the flow step size(s). At a fixed s/t0 the LATTICE tau is held (nstep scales with 1/eps), so
+    # only the integration error of the frame changes -- coarse vs fine eps. eps-tag the job only when
+    # scanning >1 eps (keeps single-eps log names clean).
+    for e in ${EPS}; do
+      etag=$(echo "${e}" | tr -d '.')
+      nsteps=""
+      for r in ${SOT}; do
+        ns=$(awk -v r="${r}" -v t="${t0}" -v ee="${e}" 'BEGIN{printf "%d", r*t/ee + 0.5}')
+        nsteps="${nsteps:+${nsteps}-}${ns}"
+      done
+      echo "  == ${L}^4 b${B}  t0=${t0}  eps=${e}  nsteps=${nsteps}  -> ${nc} configs =="
+      for C in ${cfgs}; do
+        base=$(basename "${C}")
+        tag="${base}_${L}_b${B}"
+        nsuf=""
+        if [ "${neps}" -gt 1 ]; then
+          tag="${tag}_eps${etag}"
+          nsuf="e${etag}"
+        fi
+        vars="CONFIG=${C},GRID=${GRID},NSTEPS=${nsteps},T0=${t0},TOL=${TOL},OPS=${OPS_T},FLOWS=${FLOWS_T},EPS=${e},TAG=${tag}"
+        if [ "${DRYRUN}" = "1" ]; then
+          echo "    [dryrun] qsub -N flowscan_${L}b${B//./}_${base##*.}${nsuf} -v ${vars} $(basename "${JOBSCRIPT}")"
+        else
+          jid=$(qsub -N "flowscan_${L}b${B//./}_${base##*.}${nsuf}" -terse -v "${vars}" "${JOBSCRIPT}" | tr -d '[:space:]')
+          echo "    submitted ${tag} -> job ${jid}"
+        fi
+      done
     done
   done
 done

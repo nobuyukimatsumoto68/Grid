@@ -25,6 +25,11 @@ ROOT=/projectnb/qfe/nmatsum/dwf
 SRC=${ROOT}/Grid
 BUILD=${ROOT}/build_mpi_merged
 JOBS=${JOBS:-8}
+# LIME (SciDAC I/O, needed for the q(x) dumps read by Grid/visualisation). Default = the SCC install;
+# LIME= (empty) reproduces the original no-lime configure.
+LIME=${LIME:-/share/pkg.8/lime/1.9.5/install}
+LIMEOPT=""
+if [ -n "${LIME}" ]; then LIMEOPT="--with-lime=${LIME}"; fi
 LOGDIR=${ROOT}/log
 mkdir -p "${LOGDIR}"
 LOG=${LOGDIR}/grid_build_scc_mpi_merged_claude.log
@@ -44,6 +49,7 @@ LOG=${LOGDIR}/grid_build_scc_mpi_merged_claude.log
     --with-gmp=/usr \
     --with-mpfr=/usr \
     --with-fftw=/usr \
+    ${LIMEOPT} \
     --enable-comms=mpi \
     --enable-simd=AVX \
     --enable-openmp \

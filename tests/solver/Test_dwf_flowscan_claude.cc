@@ -16,6 +16,7 @@
 
 #include <Grid/Grid.h>
 #include <Grid/qcd/utils/FreeMobius5D_claude.h>
+#include <Grid/qcd/utils/MaxTreeGaugeFix_claude.h>
 
 #include <vector>
 #include <complex>
@@ -23,6 +24,27 @@
 #include <string>
 
 using namespace Grid;
+
+// FGMRES Krylov RestartLength. FILE-SCOPE (idiom of Test_dwf_freeprec_claude.cc:68): the --fgmres_restart
+// parse in main() previously wrote to a variable that only existed inside run_flowscan -> did not compile
+// (the knob was added after the last GPU rebuild). Default 256 = effectively no-restart.
+static int g_fgmres_restart = 256;
+
+// Landau gauge-fix iteration cap. FILE-SCOPE + CLI (--gf_maxit) because 1000 UNDER-CONVERGES on
+// longer-flow / harder frames: dmuAmu stalls at O(10^2) (target 1e-12) and the M0 win is then an
+// underestimate (seen on the Q=0 config 747, 2026-09-06). Push well past 1000 and gate on the dmuAmu
+// plateau (project memory gotcha). Default kept at 1000 for back-compatibility with earlier scans.
+static int g_gf_maxit = 1000;
+
+// Gauge-fix orthogonal direction: -1 = LANDAU (fix all Nd dirs), 0..Nd-1 = COULOMB (fix the dirs !=
+// orthog, leaving `orthog` -- the time direction -- unfixed). Grid's FourierAcceleratedGaugeFixer
+// handles both via this arg. Set with --gf_orthog (or --coulomb = time dir Nd-1). Testing whether a
+// Coulomb frame beats the Landau frame for M0 (Nobu 2026-09-07).
+static int g_gf_orthog = -1;
+
+// Maximal-tree gauge frame (Taku's idea, MaxTreeGaugeFix_claude.h) instead of Landau/Coulomb, via
+// --maxtree. Single-rank only (serial nested build). Mutually exclusive with the orthog gauges.
+static bool g_maxtree = false;
 
 // Frame-flow SMOOTHER (Direction 1b, flow-kernel variation). Returns the gauge action whose gradient
 // drives the flow; beta = Nc keeps the Luscher flow-time normalization (c0+8c1=1 for the improved ones).
@@ -67,7 +89,8 @@ static void run_flowscan(const std::string& tag, LatticeGaugeFieldD& U,
   LatticeFermionD bsrc(FGrid);
   gaussian(RNG5, bsrc);
   int solve_maxit = 4000;
-  int fgmres_restart = 256;  // no-restart: RestartLength >> expected iters (not literally maxit; OOM)
+  // int fgmres_restart = 256;  // no-restart: RestartLength >> expected iters (not literally maxit; OOM)
+  int fgmres_restart = g_fgmres_restart;  // set by --fgmres_restart in main (file-scope; see top)
   NonHermitianLinearOperator<MobiusFermionD, LatticeFermionD> LinOp(D);
 
   Real plaq0 = WilsonLoops<PeriodicGimplD>::avgPlaquette(U);
@@ -90,7 +113,8 @@ static void run_flowscan(const std::string& tag, LatticeGaugeFieldD& U,
   }
 
   RealD gf_alpha = 0.1 / 16.0;  // Grid FA step is 16x too large (see run_headline); use 0.1/16
-  int gf_maxit = 1000;
+  // int gf_maxit = 1000;
+  int gf_maxit = g_gf_maxit;  // set by --gf_maxit in main (file-scope; default 1000)
   for (size_t i = 0; i < nsteps.size(); ++i) {
     int nstep = nsteps[i];
     RealD tau = flow_eps * nstep;
@@ -119,9 +143,13 @@ static void run_flowscan(const std::string& tag, LatticeGaugeFieldD& U,
       continue;
     }
     LatticeColourMatrixD xform(UGrid);
-    FourierAcceleratedGaugeFixer<PeriodicGimplD>::SteepestDescentGaugeFix(
-        Uflowed, xform, gf_alpha, gf_maxit, 1.0e-12, 1.0e-12, /*Fourier=*/true, /*orthog=*/-1,
-        /*err_on_no_converge=*/false);
+    if (g_maxtree) {
+      MaxTreeGaugeFix<PeriodicGimplD>::GaugeTransform(Uflowed, xform);  // Taku's maximal-tree frame
+    } else {
+      FourierAcceleratedGaugeFixer<PeriodicGimplD>::SteepestDescentGaugeFix(
+          Uflowed, xform, gf_alpha, gf_maxit, 1.0e-12, 1.0e-12, /*Fourier=*/true, /*orthog=*/g_gf_orthog,
+          /*err_on_no_converge=*/false);
+    }
     Real landau = 1.0 - WilsonLoops<PeriodicGimplD>::linkTrace(Uflowed);
     Real Qflow = WilsonLoops<PeriodicGimplD>::TopologicalCharge5Li(Uflowed);
 
@@ -129,9 +157,23 @@ static void run_flowscan(const std::string& tag, LatticeGaugeFieldD& U,
               << "  Landau=" << landau << "  Q_5Li(flowed)=" << Qflow << " ----" << std::endl;
 
     FreeLimitPreconditioner<WilsonImplD> M0(Ffree, xform, FGrid);
+    // Frame-match yardstick (marlborough's shared metric across the flow-eps axis, which perturbs Omega,
+    // and the Ls' axis, which perturbs F): the operator residual ||M0 D v - v||/||v|| = how far
+    // M0 = Omega^dag F Omega is from D_DW^{-1} on the REAL config. The Landau functional only sees the
+    // Omega axis (Ls'-invariant); this residual sees BOTH. Cheap: one D apply + one M0 apply on bsrc.
+    LatticeFermionD Dv(FGrid);
+    LatticeFermionD M0Dv(FGrid);
+    D.M(bsrc, Dv);
+    M0(Dv, M0Dv);
+    double m0_resid = std::sqrt(norm2(M0Dv - bsrc) / norm2(bsrc));
+    std::cout << "    M0-resid ||M0 D v - v||/||v|| = " << m0_resid << std::endl;
     if (run_m0) {
       M0.n_apply = 0;
-      FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES(solve_tol, solve_maxit, M0,
+      // Cap FGMRES(M0) iterations at 2*iter_CGNE = dW_cgne/Ls (M0 is D_W-free, CGNE = 2*Ls*iters, so M0
+      // can only WIN below this bound). Bounds the runaway on bad/pathological frames; if it hits the cap
+      // unconverged, ratio(CGNE/M0) <= 1 = "M0 did not beat CGNE". Falls back to solve_maxit if no CGNE.
+      int fgmres_maxit = (dW_cgne > 0) ? (int)(dW_cgne / Ls) : solve_maxit;
+      FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES(solve_tol, fgmres_maxit, M0,
                                                                 fgmres_restart, /*err_on_no_conv=*/false);
       LatticeFermionD xg(FGrid);
       xg = Zero();
@@ -178,7 +220,7 @@ int main(int argc, char** argv) {
   const double cc = 0.5;
   const double mm = 0.1;
   std::vector<Complex> boundary = {1, 1, 1, -1};
-  const double flow_eps = 0.02;
+  double flow_eps = 0.02;  // RK3 flow step size; overridable via --flow_eps for the step-size study
 
   Coordinate latt = GridDefaultLatt();
   Coordinate simd = GridDefaultSimd(Nd, vComplexD::Nsimd());
@@ -235,6 +277,35 @@ int main(int argc, char** argv) {
   if (GridCmdOptionExists(argv, argv + argc, "--solve_tol")) {
     std::string a = GridCmdOptionPayload(argv, argv + argc, "--solve_tol");
     GridCmdOptionFloat(a, scan_tol);
+  }
+  // FGMRES(M0/M1) Krylov RestartLength. Default 256 = effectively no-restart (huge Krylov -> expensive
+  // orthogonalisation per iter). Set small (e.g. 40) to restart -> cheap iters, more of them (bounded by
+  // the 2*iter_CGNE cap). Changes the restarted-GMRES count, so not directly comparable to no-restart runs.
+  if (GridCmdOptionExists(argv, argv + argc, "--fgmres_restart")) {
+    std::string a = GridCmdOptionPayload(argv, argv + argc, "--fgmres_restart");
+    // GridCmdOptionInt(a, fgmres_restart);
+    GridCmdOptionInt(a, g_fgmres_restart);
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--gf_maxit")) {
+    std::string a = GridCmdOptionPayload(argv, argv + argc, "--gf_maxit");
+    GridCmdOptionInt(a, g_gf_maxit);
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--gf_orthog")) {
+    std::string a = GridCmdOptionPayload(argv, argv + argc, "--gf_orthog");
+    GridCmdOptionInt(a, g_gf_orthog);
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--coulomb")) {
+    g_gf_orthog = Nd - 1;  // Coulomb: leave the time direction unfixed
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--maxtree")) {
+    g_maxtree = true;  // Taku's maximal-tree frame (single-rank; overrides the orthog gauges)
+  }
+  // Step-size study (Direction 1b Stage-3): --flow_eps overrides the RK3 flow step. At a fixed s/t0 the
+  // caller keeps tau = flow_eps*nstep constant (nstep scales with 1/eps), so only the integration error
+  // of the frame changes -- coarse vs fine eps.
+  if (GridCmdOptionExists(argv, argv + argc, "--flow_eps")) {
+    std::string a = GridCmdOptionPayload(argv, argv + argc, "--flow_eps");
+    GridCmdOptionFloat(a, flow_eps);
   }
 
   // Frame-flow KERNELS to compare (comma list; default just wilson). Each is swapped in via setGaugeAction.

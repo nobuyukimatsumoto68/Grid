@@ -34,12 +34,19 @@ NSTEPS=${NSTEPS:?set NSTEPS=<hyphen list, e.g. 58-73-87>}
 NSTEPS_C=$(echo "${NSTEPS}" | tr '-' ',')
 T0=${T0:-1.0}
 TOL=${TOL:-1e-6}
+GFMAXIT=${GFMAXIT:-1000}   # Landau gauge-fix cap; 1000 UNDER-CONVERGES on longer flow (dmuAmu stalls O(1e2)) -> use 3000+
+GAUGE=${GAUGE:-landau}     # landau (orthog=-1) | coulomb (orthog=time dir) | maxtree (Taku's tree frame)
+GAUGEFLAG=""
+if [ "${GAUGE}" = "coulomb" ]; then GAUGEFLAG="--coulomb"; fi
+if [ "${GAUGE}" = "maxtree" ]; then GAUGEFLAG="--maxtree"; fi
+EPS=${EPS:-0.02}          # RK3 flow step (step-size study); single value per job
 OPS=${OPS:-cgne-m0-m1}
 OPS_C=$(echo "${OPS}" | tr '-' ',')
 FLOWS=${FLOWS:-wilson}
 FLOWS_C=$(echo "${FLOWS}" | tr '-' ',')
 TAG=${TAG:-$(basename "${CONFIG}")}
-OUTLOG=${OUTLOG:-${LOGDIR}/flowscan_${TAG}_claude.log}
+# Per-submission UNIQUE log (never overwrite -- Nobu 2026-09-07); include the flow kernel + SGE JOB_ID.
+OUTLOG=${OUTLOG:-${LOGDIR}/flowscan_${TAG}_${FLOWS}_${GAUGE}_j${JOB_ID:-manual}_claude.log}
 
 export OMP_NUM_THREADS=${NSLOTS:-4}
 
@@ -51,6 +58,7 @@ if [ ! -f "${CONFIG}" ]; then echo "ERROR: config missing ${CONFIG}"; exit 1; fi
 # comms=none GPU build -> run the binary directly (no mpirun).
 "${BIN}" --grid "${GRID}" --mpi 1.1.1.1 --accelerator-threads 8 \
          --config "${CONFIG}" --ops "${OPS_C}" --frame_flows "${FLOWS_C}" \
-         --flow_nsteps "${NSTEPS_C}" --t0 "${T0}" --solve_tol "${TOL}" 2>&1 | tee "${OUTLOG}"
+         --flow_nsteps "${NSTEPS_C}" --flow_eps "${EPS}" --t0 "${T0}" --solve_tol "${TOL}" \
+         --gf_maxit "${GFMAXIT}" ${GAUGEFLAG} 2>&1 | tee "${OUTLOG}"
 echo "flowscanG exit = ${PIPESTATUS[0]}   $(date)"
 echo "log -> ${OUTLOG}"

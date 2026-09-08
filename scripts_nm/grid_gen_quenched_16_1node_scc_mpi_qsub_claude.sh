@@ -25,7 +25,8 @@ module load gcc/12.2.0
 module load openmpi/4.1.5_gnu-12.2.0
 
 ROOT=/projectnb/qfe/nmatsum/dwf
-BIN=${ROOT}/build_mpi/Test_hmc_IwasakiGauge_claude
+BIN=${BIN:-${ROOT}/build_mpi_merged/Test_hmc_IwasakiGauge_claude}   # merged-source binary (has the Q=0 monitor);
+                                           # BIN=.../build_mpi/... for the pre-merge no-Q0 binary (plain continuation).
 
 # ---- runtime knobs (qsub -v) ----
 GRID=${GRID:-16.16.16.16}
@@ -93,7 +94,8 @@ ARGS="--grid ${GRID} --mpi ${MPIDECOMP} --threads ${THREADS}"
 ARGS="${ARGS} --StartingType ${START} --Thermalizations ${THERM} --Trajectories ${TRAJ}"
 ARGS="${ARGS} --save_interval ${SAVE} --trajL ${TRAJL} --mdsteps ${MDSTEPS} --beta ${BETA}"
 if [ "${START}" = "CheckpointStart" ]; then
-  ARGS="${ARGS} --StartTrajectory ${STARTTRAJ}"
+  ARGS="${ARGS} --StartingTrajectory ${STARTTRAJ}"   # Grid HMC flag is --StartingTrajectory (NOT --StartTrajectory);
+                                                     # the wrong name was silently ignored -> tried ckpoint_rng.0 -> abort.
 fi
 
 echo "+ mpirun -np 1 ${BIN} ${ARGS}"

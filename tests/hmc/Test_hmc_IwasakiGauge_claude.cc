@@ -9,6 +9,59 @@
 /*  END LEGAL */
 #include <Grid/Grid.h>
 
+NAMESPACE_BEGIN(Grid);
+
+// Q=0 checkpoint observable (Nobu): after each accepted trajectory, do a SHORT gradient flow (tau~1) to
+// kill UV noise, measure the clover topological charge, and -- if |Q| < Qthresh -- write an EXTRA NERSC
+// config (a DISTINCT prefix, not ckpoint_lat.*, so the gen script's AUTORESUME frontier detection and the
+// NerscHmcCheckpointer are untouched). Catches the brief/rare trivial-Q excursions that the every-N-traj
+// checkpointer misses. Short flow + clover-Q per trajectory is cheap (pure gauge). The saved config is the
+// UNFLOWED gauge; treat it as a Q~0 CANDIDATE -- re-verify with a full flow-Q (tau=4) before use.
+template <class Impl>
+class QZeroCheckpointLogger : public HmcObservable<typename Impl::Field> {
+public:
+  INHERIT_GIMPL_TYPES(Impl);
+  typedef typename Impl::Field Field;
+  RealD flow_eps;
+  int   flow_nstep;
+  RealD Qthresh;
+  std::string prefix;
+  QZeroCheckpointLogger(RealD eps, int nstep, RealD qth, std::string pfx)
+    : flow_eps(eps), flow_nstep(nstep), Qthresh(qth), prefix(pfx) {}
+
+  void TrajectoryComplete(int traj, Field& U, GridSerialRNG& sRNG, GridParallelRNG& pRNG) override {
+    GaugeField Uflow(U.Grid());
+    WilsonFlow<Impl> wf(flow_eps, flow_nstep, /*meas_interval=*/ flow_nstep + 1);  // suppress per-step logs
+    wf.smear(Uflow, U);
+    RealD Q = WilsonLoops<Impl>::TopologicalCharge(Uflow);
+    std::cout << GridLogMessage << "Qmonitor: [ " << traj << " ] flowed clover-Q(tau="
+              << (flow_eps * flow_nstep) << ") = " << Q << std::endl;
+    if (std::abs(Q) < Qthresh) {
+      std::string fn = prefix + "." + std::to_string(traj);
+      NerscIO::writeConfiguration(U, fn, 0, 0);   // UNFLOWED config, IEEE64BIG (two_row=0, bits32=0)
+      std::cout << GridLogMessage << "Qmonitor: |Q|=" << std::abs(Q) << " < " << Qthresh
+                << " -> saved trivial-Q CANDIDATE " << fn << std::endl;
+    }
+  }
+};
+
+template <class Impl>
+class QZeroCheckpointMod : public ObservableModule<QZeroCheckpointLogger<Impl>, NoParameters> {
+  typedef ObservableModule<QZeroCheckpointLogger<Impl>, NoParameters> ObsBase;
+  RealD eps_;
+  int   nstep_;
+  RealD qth_;
+  std::string pfx_;
+  virtual void initialize() {
+    this->ObservablePtr.reset(new QZeroCheckpointLogger<Impl>(eps_, nstep_, qth_, pfx_));
+  }
+public:
+  QZeroCheckpointMod(RealD eps, int nstep, RealD qth, std::string pfx)
+    : ObsBase(NoParameters()), eps_(eps), nstep_(nstep), qth_(qth), pfx_(pfx) {}
+};
+
+NAMESPACE_END(Grid);
+
 int main(int argc, char **argv)
 {
   using namespace Grid;
@@ -44,6 +97,34 @@ int main(int argc, char **argv)
 
   typedef PlaquetteMod<HMCWrapper::ImplPolicy> PlaqObs;
   TheHMC.Resources.AddObservable<PlaqObs>();
+
+  // Q=0 checkpoint monitor: short flow (tau = q0_eps*q0_nstep ~ 1) + clover Q each trajectory; if
+  // |Q| < q0_thresh, saves an EXTRA config <q0_prefix>.<traj> (distinct prefix -> AUTORESUME/checkpointer
+  // unaffected). Catches the brief trivial-Q excursions the every-N-traj save misses. --no_q0 to disable.
+  RealD q0_eps    = 0.02;
+  int   q0_nstep  = 50;      // tau = 1.0
+  RealD q0_thresh = 0.5;
+  std::string q0_prefix = "trivialQ_lat";
+  if (GridCmdOptionExists(argv, argv + argc, "--q0_eps")) {
+    std::string a = GridCmdOptionPayload(argv, argv + argc, "--q0_eps");
+    GridCmdOptionFloat(a, q0_eps);
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--q0_nstep")) {
+    std::string a = GridCmdOptionPayload(argv, argv + argc, "--q0_nstep");
+    GridCmdOptionInt(a, q0_nstep);
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--q0_thresh")) {
+    std::string a = GridCmdOptionPayload(argv, argv + argc, "--q0_thresh");
+    GridCmdOptionFloat(a, q0_thresh);
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--q0_prefix")) {
+    q0_prefix = GridCmdOptionPayload(argv, argv + argc, "--q0_prefix");
+  }
+  if (!GridCmdOptionExists(argv, argv + argc, "--no_q0")) {
+    std::cout << GridLogMessage << "Q=0 monitor ON: flow tau=" << (q0_eps * q0_nstep)
+              << "  |Q|<" << q0_thresh << " -> save " << q0_prefix << ".<traj>" << std::endl;
+    TheHMC.Resources.AddObservable<QZeroCheckpointMod<HMCWrapper::ImplPolicy>>(q0_eps, q0_nstep, q0_thresh, q0_prefix);
+  }
 
   // Iwasaki gauge coupling from the command line (no recompile to scan lattice spacing). Default 2.6;
   // RBC/UKQCD Iwasaki gauge anchors: 2.13 (24I, a~0.11 fm), 2.25 (32I, a~0.083 fm), 2.37 (32Ifine,

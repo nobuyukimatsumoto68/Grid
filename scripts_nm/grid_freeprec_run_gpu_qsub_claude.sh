@@ -29,7 +29,8 @@ mkdir -p "${LOGDIR}"
 BIN=${ROOT}/build/Test_dwf_freeprec_claude
 GRID=${GRID:-16.16.16.16}
 CONFIG=${CONFIG:?set CONFIG=<NERSC config>}
-OUTLOG=${OUTLOG:-${LOGDIR}/freeprec_gpu_$(basename "${CONFIG}")_claude.log}
+# Per-submission UNIQUE log (never overwrite a prior run's log -- Nobu 2026-09-07). JOB_ID is set by SGE.
+OUTLOG=${OUTLOG:-${LOGDIR}/freeprec_gpu_$(basename "${CONFIG}")_j${JOB_ID:-manual}_claude.log}
 
 export OMP_NUM_THREADS=${NSLOTS:-4}
 

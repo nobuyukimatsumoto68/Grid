@@ -12,8 +12,10 @@ module load openmpi/4.1.5_gnu-12.2.0
 
 ROOT=/projectnb/qfe/nmatsum/dwf
 SRC=${ROOT}/Grid
-BUILD=${ROOT}/build_mpi
+BUILD=${BUILD:-${ROOT}/build_mpi_merged}   # merged-source CPU/MPI lib (build via grid_build_scc_mpi_merged_claude.sh);
+                                           # the pre-merge build_mpi lacks the merged BinaryIO symbols (NERSC write fails).
 GC=${BUILD}/bin/grid-config
+[ -x "${GC}" ] || GC=${BUILD}/grid-config   # merged tree keeps grid-config at the build root, not bin/
 TEST=${SRC}/tests/hmc/Test_hmc_IwasakiGauge_claude.cc
 OBJ=${BUILD}/Test_hmc_IwasakiGauge_claude.o
 BIN=${BUILD}/Test_hmc_IwasakiGauge_claude

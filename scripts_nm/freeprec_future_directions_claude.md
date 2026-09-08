@@ -100,7 +100,14 @@ flowed plaquette is NaN/out-of-range). GPU binary built (build_merged, fp32). Su
 wrapper with `FLOWS=wilson,iwasaki,antiiwasaki SOT="<fixed>"`. Metric = same M0/M1 $D_W$ ratio, now vs
 flow kernel, per $\beta$; expect Iwasaki $\gtrsim$ Wilson $\gtrsim$ anti-Iwasaki if smoothness is the lever.
 
-### 1b-Stage-3 -- STEP-SIZE scan (NEXT, after the kernel study; Nobu 2026-09-03)
+### 1b-Stage-3 -- STEP-SIZE scan (PRIORITIZED before the kernel study; Nobu 2026-09-03; TOOLING BUILT)
+Nobu (2026-09-03): do the step-size study BEFORE the flow-kernel study. Tooling DONE:
+Test_dwf_flowscan_claude.cc gained `--flow_eps` (default 0.02; syntax rc=0); the wrapper takes EPS as a
+LIST and loops it (fixed s/t0 => LATTICE tau held, nstep scales with 1/eps; eps-tags the job when >1 eps);
+both jobs (CPU/GPU) pass --flow_eps. Submit: `SOT="<fixed>" EPS="0.04 0.02 0.01" FLOWS="wilson" bash
+grid_freeprec_flowscan_wrapper_claude.sh` (needs the merged binary rebuilt -- driver changed). Coarse eps
+0.04 -> fewer RK3 steps (nstep 29 @ b2.6 SOT0.4); fine 0.01 -> more (nstep 116); same tau=1.16.
+
 At a fixed $s/t_0$ AND fixed kernel, vary the flow integration step: a COARSE eps and a FINE eps (e.g.
 $\{0.04, 0.01\}$ vs the baseline 0.02) -- test the integration-error sensitivity of the frame (does a
 coarser/cheaper flow give an as-good frame?). CODE NEEDED: add `--flow_eps` to Test_dwf_flowscan_claude.cc
@@ -170,6 +177,31 @@ CODE: (a) wires Grid's MADWF + ZMobiusFermion with $M_0/M_1$ as the inner precon
 FreeMobius5DInverse to reduced $L_s'$ + the analytic transfer (b0), then per-slice COMPLEX $b_s,c_s$ (b1) +
 $\omega_s$ tuning (Zolotarev-Remez / Yin-Mawhinney). Ref: R.C. Brower, H. Neff, K. Orginos (Mobius,
 arXiv:1206.5214); zMobius/MADWF (Yin-Mawhinney; McGlynn). PLAN before coding; measure win per variant.
+
+REVISED by the local agent (marlborough, 2026-09-03) -- cost-model pushback, ADOPT this framing:
+- Reduced-$L_s'$ helps MORE than the naive 29% block-solve: $M_0$ is FFT-DOMINATED (~61%) and the FFT
+  PAYLOAD scales $\propto L_s$, so a smaller $L_s'$ cuts BOTH the FFT and the solve -> ~2x on $M_0$ at
+  $L_s'{=}4$.
+- DROP (b0) plain reduced Mobius + the FFT micro-probe: at SMALL $m$ the sign gap on the low modes makes
+  plain Mobius the wrong rung. Make **free zMobius (b1) the PRIMARY rung**, tested at $m{=}0.1$.
+- Key expectation: at small $m$, $N_\text{it}$ is set by the GAUGE near-zero modes ($\Omega$ / "Leg-B"),
+  which zMobius does NOT touch -> its $N_\text{it}$ effect is ~NEUTRAL. So: clean ~2x cost cut IF neutral;
+  a wash IF reducing $L_s'$ perturbs the frame-match. The $L_s'$ scan measures exactly this.
+- STACKS with the custom DofFFT (payload x per-payload) -- NOT either/or.
+So: implement free zMobius $F$ at reduced $L_s'$, scan $L_s'$ at $m{=}0.1$, watch $N_\text{it}$ (neutral?)
+and the ~2x wall win. (marlborough owns this on the local/GPU repo.)
+
+SPECTRAL-SECTOR SHARPENING (marlborough, 2026-09-03) -- CORRECTS the hard-config reading: $\Omega$
+(flow-$\epsilon$) and $L_s$ perturb ORTHOGONAL sectors -- $\Omega$ = gauge/UV orientation, $L_s$ =
+$\mathrm{sign}(H_T)$ accuracy near zero (IR/chiral). The hard-config $N_\text{it}$ (640: ~455 at BOTH
+$\epsilon$) lives in the near-zero IR sector -- exactly where $L_s'$ BITES and $\Omega$ does NOT. So
+"frame($\Omega$)-invariant" does NOT imply "$L_s'$-invariant" for them. This FLIPS their role: the hard
+configs (640/280/460) are the DECISIVE $L_s'$-neutrality test, not reassurance, and (small $m$ = IR-
+dominated) they preview small-$m$. It is the RIGHT test, not a red flag, because zMobius's Zolotarev
+$\omega_s$ are built to HOLD the IR sign accuracy -- the residual proxy $\|M_0 D v - v\|/\|v\|$ measures
+whether they did. marlborough's $L_s'$ scan will include 640/280/460 + report the residual; verdict =
+does the hard-config $N_\text{it}$ stay flat as $L_s'$ drops. SCC to re-emit the flow-$\epsilon$ residual
+on one hard (640) + one typical (340/580) so the two axes overlay on the same $\|M_0 D v - v\|$ axis.
 
 ## Cross-cutting: the metric for "optimal"
 Whenever we say "optimal" (flow time, flow type, direct-GD, deflation), the primary yardstick is the
