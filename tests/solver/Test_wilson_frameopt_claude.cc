@@ -7,7 +7,10 @@
 #include <Grid/Grid.h>
 #include <Grid/qcd/utils/FreeWilson_claude.h>
 #include <Grid/algorithms/iterative/ImplicitlyRestartedArnoldi_claude.h>
+#include <Grid/algorithms/iterative/ChebyshevEllipse_claude.h>
 #include <sstream>
+#include <fstream>
+#include <cstdio>
 
 using namespace Grid;
 
@@ -28,6 +31,189 @@ struct M0DwLinOp : public LinearFunction<LatticeFermionD> {
     M0(tmp, out);
   }
 };
+// H_W = gamma5 D_W (the hermitian Wilson operator): real eigenvalues (both signs), |lambda_HW| = singular
+// values of D_W. Used by --opscan.
+struct HwLinOp : public LinearFunction<LatticeFermionD> {
+  WilsonFermionD& Dw;
+  mutable LatticeFermionD tmp;
+  HwLinOp(WilsonFermionD& d, GridBase* g) : Dw(d), tmp(g) {}
+  void operator()(const LatticeFermionD& in, LatticeFermionD& out) {
+    Gamma g5(Gamma::Algebra::Gamma5);
+    Dw.M(in, tmp);
+    out = g5 * tmp;            // H_W = gamma5 D_W
+  }
+};
+// M1 D_W (next-order preconditioned operator): spectrum mu should cluster near 1; the quality metric on an
+// eigenmode is C = |1 - mu| (>=1 = red flag). Used by --opscan.
+struct M1DwLinOp : public LinearFunction<LatticeFermionD> {
+  WilsonFermionD& Dw;
+  FreeLimitPreconditionerW1<WilsonImplD>& M1;
+  mutable LatticeFermionD tmp;
+  M1DwLinOp(WilsonFermionD& d, FreeLimitPreconditionerW1<WilsonImplD>& m, GridBase* g) : Dw(d), M1(m), tmp(g) {}
+  void operator()(const LatticeFermionD& in, LatticeFermionD& out) {
+    Dw.M(in, tmp);
+    M1(tmp, out);             // M1 D_W
+  }
+};
+// Mx D_W (scale-mixed preconditioned operator); C on an eigenmode = |1 - mu|. Used by --mx.
+struct MxDwLinOp : public LinearFunction<LatticeFermionD> {
+  WilsonFermionD& Dw;
+  FreeLimitPreconditionerWx<WilsonImplD>& Mx;
+  mutable LatticeFermionD tmp;
+  MxDwLinOp(WilsonFermionD& d, FreeLimitPreconditionerWx<WilsonImplD>& m, GridBase* g) : Dw(d), Mx(m), tmp(g) {}
+  void operator()(const LatticeFermionD& in, LatticeFermionD& out) {
+    Dw.M(in, tmp);
+    Mx(tmp, out);             // Mx D_W
+  }
+};
+// Shift-invert-at-zero operator: out = D_W^{-1} in via CGNE (CG on the Hermitian-PD normal operator
+// D_W^dag D_W), so out = (D^dag D)^{-1} D^dag in = D^{-1} in. Fed to IRA (largest-modulus wanted): the
+// largest |1/lambda| are D_W's SMALLEST |lambda| -- Arnoldi's easy, STABLE case (diagnosis fix 3). The
+// near-zero D_W modes converge fast + accurately; the true lambda is recovered by the RR-cleanup.
+struct ShiftInvertZeroOp : public LinearFunction<LatticeFermionD> {
+  WilsonFermionD& Dw;
+  MdagMLinearOperator<WilsonFermionD, LatticeFermionD> NormalOp;
+  ConjugateGradient<LatticeFermionD> CG;
+  mutable LatticeFermionD ddagb;
+  ShiftInvertZeroOp(WilsonFermionD& d, GridBase* g, double tol, int maxit)
+    : Dw(d), NormalOp(d), CG(tol, maxit, false), ddagb(g) {}
+  void operator()(const LatticeFermionD& in, LatticeFermionD& out) {
+    Dw.Mdag(in, ddagb);        // D^dag in
+    out = Zero();
+    CG(NormalOp, ddagb, out);  // out = (D^dag D)^{-1} D^dag in = D^{-1} in
+  }
+};
+// Deflated (two-level) preconditioner: wraps a base preconditioner M and a deflation subspace V (columns =
+// the near-zero D_W eigenmodes the IRA found). Additive coarse-grid correction:
+//   x_c = V A_c^{-1} V^dag r,   out = x_c + M (r - D_W x_c),   A_c = V^dag D_W V (small dense, Eigen).
+// The coarse (deflation) space is inverted EXACTLY, so the near-zero modes are removed from the spectrum
+// FGMRES sees -> the topological blockers stop limiting the outer count. Cost/apply = base M + 1 extra D_W.
+struct DeflatedPrec : public LinearFunction<LatticeFermionD> {
+  LinearFunction<LatticeFermionD>& M;      // base preconditioner (M0 or M1)
+  WilsonFermionD& Dw;
+  std::vector<LatticeFermionD>& V;         // orthonormal deflation vectors
+  std::vector<LatticeFermionD> AV;         // D_W V (precomputed)
+  Eigen::MatrixXcd Acinv;                  // (V^dag D_W V)^{-1}
+  int nc;
+  mutable LatticeFermionD xc, r2, Mr;
+  DeflatedPrec(LinearFunction<LatticeFermionD>& M_, WilsonFermionD& d,
+               std::vector<LatticeFermionD>& V_, GridBase* g)
+    : M(M_), Dw(d), V(V_), xc(g), r2(g), Mr(g) {
+    nc = (int)V.size();
+    for (int j = 0; j < nc; ++j) {
+      LatticeFermionD t(g);
+      Dw.M(V[j], t);
+      AV.push_back(t);
+    }
+    Eigen::MatrixXcd Ac(nc, nc);
+    for (int i = 0; i < nc; ++i) {
+      for (int j = 0; j < nc; ++j) {
+        ComplexD o = innerProduct(V[i], AV[j]);
+        Ac(i, j) = std::complex<double>(real(o), imag(o));
+      }
+    }
+    Acinv = Ac.inverse();
+  }
+  void operator()(const LatticeFermionD& in, LatticeFermionD& out) {
+    Eigen::VectorXcd vr(nc);
+    for (int i = 0; i < nc; ++i) {
+      ComplexD o = innerProduct(V[i], in);
+      vr(i) = std::complex<double>(real(o), imag(o));
+    }
+    Eigen::VectorXcd y = Acinv * vr;       // A_c^{-1} V^dag r
+    xc = Zero();
+    for (int i = 0; i < nc; ++i) {
+      ComplexD c(y(i).real(), y(i).imag());
+      axpy(xc, c, V[i], xc);               // x_c = V y
+    }
+    Dw.M(xc, r2);                          // D_W x_c
+    r2 = in - r2;                          // r - D_W x_c
+    M(r2, Mr);                             // base smooth
+    out = xc + Mr;
+  }
+};
+// Run right-preconditioned FGMRES on D_W with preconditioner `prec`, return the outer iteration count.
+static int run_fgmres(NonHermitianLinearOperator<WilsonFermionD, LatticeFermionD>& LinOp,
+                      LinearFunction<LatticeFermionD>& prec, const LatticeFermionD& b,
+                      RealD tol, int maxit, int restart) {
+  FlexibleGeneralisedMinimalResidual<LatticeFermionD> F(tol, maxit, prec, restart, false);
+  LatticeFermionD x(b.Grid());
+  x = Zero();
+  F(LinOp, b, x);
+  return F.IterationCount;
+}
+// Scan one operator: extract the single most-extreme eigenpair at BOTH ends (LOW = smallest modulus via IRA,
+// HIGH = largest modulus via IRA), and on that eigenvector psi evaluate the preconditioner quality
+// C = ||(1 - M D_W) psi|| / ||psi|| (= |1 - mu| when psi is an eigenmode of M D_W) for BOTH M0 and M1.
+// C>=1 = red flag (that mode amplifies under stationary iteration). `resid` = ||Op psi - eval psi||/||psi||
+// (IRA convergence quality of the reported eigenpair).
+static void opscan_one(const char* name,
+                       LinearFunction<LatticeFermionD>& Op,
+                       LinearFunction<LatticeFermionD>& m0op,
+                       LinearFunction<LatticeFermionD>& m1op,
+                       const LatticeFermionD& src, int Nstop, int Nk, int Nm, int maxit) {
+  GridBase* g = src.Grid();
+  for (int end = 0; end < 2; ++end) {
+    IRAsortCriterion crit = (end == 0) ? IRAsmallestModulus : IRAlargestModulus;
+    const char* endname = (end == 0) ? "LOW " : "HIGH";
+    std::vector<ComplexD> eval;
+    std::vector<LatticeFermionD> evec(Nm + 1, LatticeFermionD(g));
+    int Nconv = 0;
+    ImplicitlyRestartedArnoldi<LatticeFermionD> ira(Op, Nstop, Nk, Nm, 1.0e-6, maxit, crit);
+    ira.calc(eval, evec, src, Nconv);
+    if (Nconv <= 0) {
+      std::cout << GridLogMessage << "  OPSCAN " << name << " " << endname << ": no converged mode"
+                << std::endl;
+      continue;
+    }
+    LatticeFermionD psi(g);
+    psi = evec[0];
+    RealD npsi = std::sqrt(norm2(psi));
+    LatticeFermionD MDpsi(g), r(g), Opsi(g);
+    m0op(psi, MDpsi);
+    r = psi - MDpsi;
+    RealD C0 = std::sqrt(norm2(r)) / npsi;
+    m1op(psi, MDpsi);
+    r = psi - MDpsi;
+    RealD C1 = std::sqrt(norm2(r)) / npsi;
+    Op(psi, Opsi);
+    axpy(r, -eval[0], psi, Opsi);              // Op psi - eval psi
+    RealD resid = std::sqrt(norm2(r)) / npsi;
+    double re = real(eval[0]);
+    double im = imag(eval[0]);
+    double mod = std::sqrt(re * re + im * im);
+    std::cout << GridLogMessage << "  OPSCAN " << name << " " << endname << ": eval=(" << re << "," << im
+              << ")  |eval|=" << mod << "  (resid " << resid << ")   C_M0=" << C0 << (C0 >= 1.0 ? "(RED)" : "")
+              << "   C_M1=" << C1 << (C1 >= 1.0 ? "(RED)" : "") << std::endl;
+  }
+}
+// Scan a preconditioned operator M D_W at BOTH ends and report its own eigenvalue mu + quality C = |1 - mu|
+// (= ||(1 - M D_W) psi||/||psi|| on an eigenmode). C>=1 (Re mu<0, or a large Im mu) = red flag. Used by --mx
+// to compare M0/M1/Mx_inner/Mx_outer spectra.
+static void opscan_mx(const char* name, LinearFunction<LatticeFermionD>& MxDw,
+                      const LatticeFermionD& src, int Nstop, int Nk, int Nm, int maxit) {
+  GridBase* g = src.Grid();
+  for (int end = 0; end < 2; ++end) {
+    IRAsortCriterion crit = (end == 0) ? IRAsmallestModulus : IRAlargestModulus;
+    const char* endname = (end == 0) ? "LOW " : "HIGH";
+    std::vector<ComplexD> eval;
+    std::vector<LatticeFermionD> evec(Nm + 1, LatticeFermionD(g));
+    int Nconv = 0;
+    ImplicitlyRestartedArnoldi<LatticeFermionD> ira(MxDw, Nstop, Nk, Nm, 1.0e-6, maxit, crit);
+    ira.calc(eval, evec, src, Nconv);
+    if (Nconv <= 0) {
+      std::cout << GridLogMessage << "  MXSCAN " << name << " " << endname << ": no converged mode"
+                << std::endl;
+      continue;
+    }
+    double re = real(eval[0]);
+    double im = imag(eval[0]);
+    double C = std::sqrt((1.0 - re) * (1.0 - re) + im * im);
+    std::cout << GridLogMessage << "  MXSCAN " << name << " " << endname << ": mu=(" << re << "," << im
+              << ")  |mu|=" << std::sqrt(re * re + im * im) << "   C=|1-mu|=" << C << (C >= 1.0 ? "(RED)" : "")
+              << std::endl;
+  }
+}
 
 // ================= DIRECT FRAME OPTIMIZER (ported from dwf4 dwf4_frameopt_claude.h) =================
 // Minimize L[Omega] = sum_v ||M0(Omega) D_W v - v||^2, M0 = Omega^dag F Omega, by gradient descent on the
@@ -158,6 +344,14 @@ static void solve_wilson(LatticeGaugeFieldD& U, GridCartesian* UGrid, GridRedBla
   WilsonFermionD Dw(U, *UGrid, *UrbGrid, mass, params);
   FreeWilsonInverse<WilsonImplD> Fw(UGrid, mprec, boundary);
   FreeLimitPreconditionerW<WilsonImplD> M0(Fw, xform, UGrid);
+  // M1_W (next-order) preconditioner: needs D_W on the framed config U^L = Omega U Omega^dag (at m_prec).
+  LatticeGaugeFieldD Uframed(UGrid);
+  Uframed = U;
+  LatticeColourMatrixD gtr(UGrid);
+  gtr = xform;
+  SU<Nc>::GaugeTransform<PeriodicGimplD>(Uframed, gtr);
+  WilsonFermionD Dframed(Uframed, *UGrid, *UrbGrid, mprec, params);
+  FreeLimitPreconditionerW1<WilsonImplD> M1(Fw, xform, Dframed, UGrid);
 
   LatticeFermionD bsrc(UGrid);
   gaussian(RNG, bsrc);
@@ -226,6 +420,31 @@ static void solve_wilson(LatticeGaugeFieldD& U, GridCartesian* UGrid, GridRedBla
   }
   std::cout << GridLogMessage << "  FGMRES(M0_W) restart=" << restart << ": iters=" << fg_iters
             << "  WALL=" << tw_fg / 1.0e6 << " s  (min of " << repeat << ")" << std::endl;
+
+  // FGMRES right-preconditioned by M1_W (next-order). M1 costs +1 interacting D_W[U^L] per apply, so the
+  // honest metric is BOTH outer iters (does M1 cut them vs M0) and the added D_W[U^L] applies.
+  FlexibleGeneralisedMinimalResidual<LatticeFermionD> FGMRES1(tol, maxit, M1, restart, false);
+  LatticeFermionD xg1(UGrid);
+  double tw_fg1 = 1.0e30;
+  int fg1_iters = 0;
+  long m1_ndw = 0;
+  for (int r = 0; r < repeat; ++r) {
+    xg1 = Zero();
+    M1.n_dw = 0;
+    double t = -usecond();
+    FGMRES1(LinOp, bsrc, xg1);
+    t += usecond();
+    if (t < tw_fg1) {
+      tw_fg1 = t;
+    }
+    fg1_iters = FGMRES1.IterationCount;
+    m1_ndw = M1.n_dw;
+  }
+  std::cout << GridLogMessage << "  FGMRES(M1_W) restart=" << restart << ": iters=" << fg1_iters
+            << "  WALL=" << tw_fg1 / 1.0e6 << " s  (min of " << repeat << ")  [+" << m1_ndw
+            << " D_W[U^L] applies]" << std::endl;
+  std::cout << GridLogMessage << "  N_it(M0)/N_it(M1) = " << ((fg1_iters > 0) ? (double)fg_iters / fg1_iters : 0.0)
+            << "   (>1 = M1 cuts outer iterations)" << std::endl;
   if (tw_fg > 0.0) {
     std::cout << GridLogMessage << "  WALL speedup (RB-CGNE / FGMRES-M0_W)  = " << (tw_rb / tw_fg)
               << "x  [>1 = free-prec beats RB-CGNE (hard bar)]" << std::endl;
@@ -429,12 +648,96 @@ int main(int argc, char** argv) {
 
       std::cout << GridLogMessage << "==== SPECTRUM  m=" << mass << " mprec=" << mprec
                 << "  Nstop=" << Nstop << " Nk=" << Nk << " Nm=" << Nm << " ====" << std::endl;
-      // (1) D_W low spectrum
-      std::cout << GridLogMessage << "-- D_W low spectrum (IRA, smallest |lambda|) --" << std::endl;
+      // (1) D_W low spectrum. Two subspace generators feed the SAME RR-cleanup below (which uses Dwsp.M,
+      // so the recovered lambda/chi/resid are exact for D_W regardless of generator):
+      //   default : plain IRA on D_W, smallest-|lambda| wanted (now with the Chunk-A Leja + reorthog fixes).
+      //   --faber : IRA on the Chebyshev-ellipse FILTER p_n(D_W) (largest-modulus wanted); the ellipse
+      //             encloses the bulk so the near-zero modes become peripheral = Arnoldi's stable case.
       DwLinOp dwop(Dwsp);
-      ImplicitlyRestartedArnoldi<LatticeFermionD> iraD(dwop, Nstop, Nk, Nm, 1.0e-6, spmaxit);
-      iraD.calc(eval, evec, src, Nconv);
-      std::cout << GridLogMessage << "  D_W: Nconv=" << Nconv << std::endl;
+      if (GridCmdOptionExists(argv, argv + argc, "--shiftinvert")) {
+        double sitol = 1.0e-8;
+        int simaxit = 5000;
+        if (GridCmdOptionExists(argv, argv + argc, "--si-tol")) {
+          sitol = std::stod(GridCmdOptionPayload(argv, argv + argc, "--si-tol"));
+        }
+        std::cout << GridLogMessage
+                  << "-- D_W low spectrum (SHIFT-INVERT IRA: CGNE D_W^{-1}, largest-modulus, sitol=" << sitol
+                  << ") --" << std::endl;
+        ShiftInvertZeroOp si(Dwsp, UGrid, sitol, simaxit);
+        ImplicitlyRestartedArnoldi<LatticeFermionD> iraSI(si, Nstop, Nk, Nm, 1.0e-6, spmaxit,
+                                                          IRAlargestModulus);
+        iraSI.calc(eval, evec, src, Nconv);
+        std::cout << GridLogMessage << "  D_W (shift-invert): Nconv=" << Nconv << std::endl;
+      } else if (GridCmdOptionExists(argv, argv + argc, "--faber")) {
+        int ford = 12;
+        if (GridCmdOptionExists(argv, argv + argc, "--faber-ord")) {
+          ford = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--faber-ord"));
+        }
+        // Estimate the spectrum (Nm Ritz values of a single Nm-step Arnoldi) to fit the bulk ellipse.
+        ImplicitlyRestartedArnoldi<LatticeFermionD> iraEst(dwop, Nstop, Nk, Nm, 1.0e-6, spmaxit);
+        std::vector<ComplexD> allr;
+        iraEst.ritz_estimate(src, allr);
+        // Separate WANTED (smallest |lambda|) from BULK. Optional |lambda| cutoff via --faber-lo.
+        double locut = -1.0;
+        if (GridCmdOptionExists(argv, argv + argc, "--faber-lo")) {
+          locut = std::stod(GridCmdOptionPayload(argv, argv + argc, "--faber-lo"));
+        }
+        // NB: std::abs(ComplexD) is unavailable under the CUDA build (ComplexD = thrust::complex); use the
+        // explicit modulus via real()/imag() (the confirmed Grid free functions).
+        std::vector<std::pair<double, int> > om(allr.size());
+        for (size_t i = 0; i < allr.size(); ++i) {
+          double m = std::sqrt(real(allr[i]) * real(allr[i]) + imag(allr[i]) * imag(allr[i]));
+          om[i] = std::make_pair(m, (int)i);
+        }
+        std::sort(om.begin(), om.end());
+        double remin = 1.0e300, remax = -1.0e300, immax = 0.0;
+        int nb = 0;
+        for (size_t s = 0; s < allr.size(); ++s) {
+          int i = om[s].second;
+          double mi = std::sqrt(real(allr[i]) * real(allr[i]) + imag(allr[i]) * imag(allr[i]));
+          bool bulk = (locut > 0.0) ? (mi > locut) : ((int)s >= Nstop);
+          if (!bulk) {
+            continue;
+          }
+          double re = real(allr[i]);
+          double im = std::abs(imag(allr[i]));
+          remin = std::min(remin, re);
+          remax = std::max(remax, re);
+          immax = std::max(immax, im);
+          nb++;
+        }
+        double cc = 0.5 * (remin + remax);
+        double aa = 0.5 * (remax - remin);
+        double bb = immax;
+        std::complex<double> dstd = std::sqrt(std::complex<double>(aa * aa - bb * bb, 0.0));
+        double floor = 1.0e-6 * std::max(1.0, std::max(aa, bb));
+        if (std::abs(dstd) < floor) {
+          dstd = std::complex<double>(std::max(aa, floor), 0.0);
+        }
+        ComplexD cf(cc, 0.0);
+        ComplexD df(dstd.real(), dstd.imag());
+        if (GridCmdOptionExists(argv, argv + argc, "--faber-c")) {
+          cf = ComplexD(std::stod(GridCmdOptionPayload(argv, argv + argc, "--faber-c")), 0.0);
+        }
+        if (GridCmdOptionExists(argv, argv + argc, "--faber-d")) {
+          df = ComplexD(std::stod(GridCmdOptionPayload(argv, argv + argc, "--faber-d")), 0.0);
+        }
+        std::cout << GridLogMessage << "-- D_W low spectrum (FABER: IRA on T_" << ford
+                  << "((D_W-c)/d), largest-modulus wanted) --" << std::endl;
+        std::cout << GridLogMessage << "   bulk fit (" << nb << " Ritz): Re in [" << remin << "," << remax
+                  << "]  max|Im|=" << immax << "  -> c=(" << real(cf) << "," << imag(cf) << ")  d=("
+                  << real(df) << "," << imag(df) << ")" << std::endl;
+        ChebyshevEllipse<LatticeFermionD> cheb(dwop, cf, df, ford);
+        ImplicitlyRestartedArnoldi<LatticeFermionD> iraF(cheb, Nstop, Nk, Nm, 1.0e-6, spmaxit,
+                                                         IRAlargestModulus);
+        iraF.calc(eval, evec, src, Nconv);
+        std::cout << GridLogMessage << "  D_W (Faber): Nconv=" << Nconv << std::endl;
+      } else {
+        std::cout << GridLogMessage << "-- D_W low spectrum (IRA, smallest |lambda|) --" << std::endl;
+        ImplicitlyRestartedArnoldi<LatticeFermionD> iraD(dwop, Nstop, Nk, Nm, 1.0e-6, spmaxit);
+        iraD.calc(eval, evec, src, Nconv);
+        std::cout << GridLogMessage << "  D_W: Nconv=" << Nconv << std::endl;
+      }
       // FIX 1 -- RAYLEIGH-RITZ CLEANUP of the returned subspace: the IRA restart accumulates factorization
       // error (internal estimate optimistic vs the true residual), so extract the BEST eigenpairs from the
       // returned span {evec[0..Nconv-1]} directly: GS-orthonormalize -> Hs = B^dag D_W B (Nconv x Nconv) ->
@@ -531,6 +834,290 @@ int main(int argc, char** argv) {
           std::cout << GridLogMessage << "  M0act[" << k << "]  |lam|=" << std::sqrt(real(rr_lam[k])*real(rr_lam[k])+imag(rr_lam[k])*imag(rr_lam[k]))
                     << "   chi=" << rr_chi[k] << "   |M0DWphi|/|phi|=" << ratio
                     << "   |M0DWphi-phi|/|phi|=" << res << std::endl;
+        }
+      }
+      // (3) SAME test with M1 = next-order (hopping-expansion) correction. M1 = Omega^dag{F - F D(tildeA) F}Omega
+      // with tildeA = U^L - 1, U^L = Omega U Omega^dag (framed config), D(tildeA) = D_W[U^L] - D_W^free. Does
+      // adding the leading D_W[U^L] correction rescue the chiral sector M0 fails on? (Brower+Izubuchi.)
+      LatticeGaugeFieldD Uframed(UGrid);
+      Uframed = U;
+      LatticeColourMatrixD gtrans(UGrid);
+      gtrans = xform;
+      SU<Nc>::GaugeTransform<PeriodicGimplD>(Uframed, gtrans);  // U^L = Omega U Omega^dag
+      WilsonImplD::ImplParams p1(bnd);
+      WilsonFermionD Dframed(Uframed, *UGrid, *UrbGrid, mprec, p1);
+      FreeLimitPreconditionerW1<WilsonImplD> M1L(Ffo, xform, Dframed, UGrid);
+      std::cout << GridLogMessage << "-- M1 (Landau frame, next-order) acting on D_W eigenmodes --" << std::endl;
+      {
+        LatticeFermionD Dphi(UGrid), M1Dphi(UGrid), diff(UGrid);
+        for (size_t k = 0; k < rr_mode.size(); ++k) {
+          Dwsp.M(rr_mode[k], Dphi);
+          M1L(Dphi, M1Dphi);            // M1 D_W phi
+          RealD ratio = std::sqrt(norm2(M1Dphi));
+          diff = M1Dphi - rr_mode[k];
+          RealD res = std::sqrt(norm2(diff));
+          std::cout << GridLogMessage << "  M1act[" << k << "]  |lam|=" << std::sqrt(real(rr_lam[k])*real(rr_lam[k])+imag(rr_lam[k])*imag(rr_lam[k]))
+                    << "   chi=" << rr_chi[k] << "   |M1DWphi|/|phi|=" << ratio
+                    << "   |M1DWphi-phi|/|phi|=" << res << std::endl;
+        }
+      }
+      // (4) SAVE the D_W eigenmodes (important -- for deflation/reuse) as a LIME/Scidac field file + a text
+      // metadata file (idx, lambda_re, lambda_im, chi). Guarded by --save-modes <path-prefix>.
+      if (GridCmdOptionExists(argv, argv + argc, "--save-modes")) {
+        std::string pref = GridCmdOptionPayload(argv, argv + argc, "--save-modes");
+        std::string fn = pref + ".lime";
+        ScidacWriter sw(UGrid->IsBoss());
+        sw.open(fn);
+        emptyUserRecord rec;
+        for (size_t k = 0; k < rr_mode.size(); ++k) {
+          sw.writeScidacFieldRecord(rr_mode[k], rec);
+        }
+        sw.close();
+        if (UGrid->IsBoss()) {
+          std::ofstream meta((pref + ".meta.txt").c_str());
+          meta << "# idx  lambda_re  lambda_im  chi" << std::endl;
+          for (size_t k = 0; k < rr_mode.size(); ++k) {
+            meta << k << "  " << real(rr_lam[k]) << "  " << imag(rr_lam[k]) << "  " << rr_chi[k] << std::endl;
+          }
+          meta.close();
+        }
+        std::cout << GridLogMessage << "  SAVED " << rr_mode.size() << " D_W modes -> " << fn
+                  << " (+ .meta.txt)" << std::endl;
+      }
+      // (4c) SCALE-MIXED Mx (--mx, user 2026-09-05): build INNER & OUTER Mx (the M1 hopping correction band-
+      // limited to the low kinetic band |sin p|<Acut) and COMPARE the quality C=||(1-M D_W)phi||/||phi|| for
+      // M0 / M1 / Mx_in / Mx_out on the D_W eigenmodes, plus the extreme-mode spectrum (does Mx remove M1's UV
+      // red-flag mu=0.865+1.238i?). Knobs --mx-acut (default 1.0), --mx-smooth, --mx-width.
+      if (GridCmdOptionExists(argv, argv + argc, "--mx")) {
+        double mx_width = 0.3;
+        bool mx_smooth = GridCmdOptionExists(argv, argv + argc, "--mx-smooth");
+        if (GridCmdOptionExists(argv, argv + argc, "--mx-width")) {
+          mx_width = std::stod(GridCmdOptionPayload(argv, argv + argc, "--mx-width"));
+        }
+        // Acut list: --mx-acut-list "0.5,0.7,1.0,1.5" (scan) OR single --mx-acut (default 1.0).
+        std::vector<double> acuts;
+        if (GridCmdOptionExists(argv, argv + argc, "--mx-acut-list")) {
+          std::string s = GridCmdOptionPayload(argv, argv + argc, "--mx-acut-list");
+          std::stringstream ss(s);
+          std::string tok;
+          while (std::getline(ss, tok, ',')) {
+            acuts.push_back(std::stod(tok));
+          }
+        } else if (GridCmdOptionExists(argv, argv + argc, "--mx-acut")) {
+          acuts.push_back(std::stod(GridCmdOptionPayload(argv, argv + argc, "--mx-acut")));
+        } else {
+          acuts.push_back(1.0);
+        }
+        WilsonImplD::ImplParams pfree(bnd);
+        WilsonFermionD Dfree(Uunit, *UGrid, *UrbGrid, mprec, pfree);   // free (unit-gauge) Wilson at m_prec
+        // M0 / M1 reference extremes (Acut-independent), once.
+        std::cout << GridLogMessage << "== Mx scan (" << (mx_smooth ? "smooth" : "sharp")
+                  << "): M0/M1 reference + Acut sweep ==" << std::endl;
+        M0DwLinOp m0op(Dwsp, M0L, UGrid);
+        M1DwLinOp m1op(Dwsp, M1L, UGrid);
+        opscan_mx("M0 D_W   ", m0op, src, 6, 16, 32, spmaxit);
+        opscan_mx("M1 D_W   ", m1op, src, 6, 16, 32, spmaxit);
+        for (size_t ia = 0; ia < acuts.size(); ++ia) {
+          double mx_acut = acuts[ia];
+          Ffo.build_bandmask(mx_acut, mx_smooth, mx_width);
+          FreeLimitPreconditionerWx<WilsonImplD> MxIn(Ffo, xform, Dframed, Dfree, UGrid, true);
+          FreeLimitPreconditionerWx<WilsonImplD> MxOut(Ffo, xform, Dframed, Dfree, UGrid, false);
+          // mean C on chiral vs bulk D_W modes (the IR gain), for MxIn/MxOut vs M0/M1
+          RealD cch_m1 = 0.0, cch_i = 0.0, cch_o = 0.0, cbu_i = 0.0, cbu_o = 0.0, cbu_m1 = 0.0;
+          int nch = 0, nbu = 0;
+          LatticeFermionD Dphi(UGrid), t(UGrid), r(UGrid);
+          for (size_t k = 0; k < rr_mode.size(); ++k) {
+            Dwsp.M(rr_mode[k], Dphi);
+            M1L(Dphi, t);
+            r = rr_mode[k] - t;
+            RealD c1 = std::sqrt(norm2(r));
+            MxIn(Dphi, t);
+            r = rr_mode[k] - t;
+            RealD ci = std::sqrt(norm2(r));
+            MxOut(Dphi, t);
+            r = rr_mode[k] - t;
+            RealD co = std::sqrt(norm2(r));
+            if (std::abs(rr_chi[k]) > 0.5) {
+              cch_m1 += c1;
+              cch_i += ci;
+              cch_o += co;
+              nch++;
+            } else {
+              cbu_m1 += c1;
+              cbu_i += ci;
+              cbu_o += co;
+              nbu++;
+            }
+          }
+          std::cout << GridLogMessage << "-- Acut=" << mx_acut << " : mean C(chiral) M1=" << (cch_m1 / nch)
+                    << " MxIn=" << (cch_i / nch) << " MxOut=" << (cch_o / nch) << " | mean C(bulk) M1="
+                    << (cbu_m1 / nbu) << " MxIn=" << (cbu_i / nbu) << " MxOut=" << (cbu_o / nbu) << std::endl;
+          char nmi[32], nmo[32];
+          std::snprintf(nmi, sizeof(nmi), "MxIn(A=%.2f) ", mx_acut);
+          std::snprintf(nmo, sizeof(nmo), "MxOut(A=%.2f)", mx_acut);
+          MxDwLinOp mxinop(Dwsp, MxIn, UGrid);
+          MxDwLinOp mxoutop(Dwsp, MxOut, UGrid);
+          opscan_mx(nmi, mxinop, src, 6, 16, 32, spmaxit);
+          opscan_mx(nmo, mxoutop, src, 6, 16, 32, spmaxit);
+        }
+      }
+      // (4a) OPERATOR SPECTRUM SCAN (--opscan, user 2026-09-05): extract the LOWEST (smallest modulus) and
+      // HIGHEST (largest modulus) eigenpair of D_W, H_W=gamma5 D_W, M0 D_W, M1 D_W, and evaluate the
+      // preconditioner quality C=||(1-M D_W)psi||/||psi|| (=|1-mu| on an eigenmode of M D_W) for M0 and M1 on
+      // each extreme eigenvector. C>=1 (equivalently Re mu<0 for the M D_W eigenvalues) = red flag: the prec
+      // amplifies/flips that mode. Answers "does the free-prec ever flip a mode, or only under-contract?".
+      if (GridCmdOptionExists(argv, argv + argc, "--opscan")) {
+        int os_ns = 6, os_nk = 16, os_nm = 32;
+        DwLinOp dwop(Dwsp);
+        HwLinOp hwop(Dwsp, UGrid);
+        M0DwLinOp m0op(Dwsp, M0L, UGrid);
+        M1DwLinOp m1op(Dwsp, M1L, UGrid);
+        std::cout << GridLogMessage
+                  << "== OPSCAN: lowest & highest eigenpair of D_W, H_W, M0 D_W, M1 D_W (+ C=|1-M D_W|) =="
+                  << std::endl;
+        opscan_one("D_W   ", dwop, m0op, m1op, src, os_ns, os_nk, os_nm, spmaxit);
+        opscan_one("H_W   ", hwop, m0op, m1op, src, os_ns, os_nk, os_nm, spmaxit);
+        opscan_one("M0 D_W", m0op, m0op, m1op, src, os_ns, os_nk, os_nm, spmaxit);
+        opscan_one("M1 D_W", m1op, m0op, m1op, src, os_ns, os_nk, os_nm, spmaxit);
+      }
+      // (4b) SOLVER COUNTS incl. DEFLATION (--solve-deflate, user 2026-09-05): actually invert D_W x = b and
+      // count outer iterations for RB-CGNE (baseline), FGMRES(M0), FGMRES(M1), and BOTH deflated by the
+      // chiral zero modes (DeflatedPrec: exact solve on span{chiral modes} + base prec). Does deflating the
+      // topological blocker sector cut the outer count? Honest note: M1 adds 1 D_W[U^L]/apply, deflation
+      // adds 1 D_W/apply. Uses the in-memory chiral modes (|chi|>0.5); M0L/M1L are the Landau-frame precs.
+      if (GridCmdOptionExists(argv, argv + argc, "--solve-deflate")) {
+        int srst = 20;
+        if (GridCmdOptionExists(argv, argv + argc, "--solve-restart")) {
+          srst = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--solve-restart"));
+        }
+        // orthonormalize the chiral modes -> deflation basis V (MGS)
+        std::vector<LatticeFermionD> V;
+        for (size_t k = 0; k < rr_mode.size(); ++k) {
+          if (std::abs(rr_chi[k]) > 0.5) {
+            V.push_back(rr_mode[k]);
+          }
+        }
+        for (size_t i = 0; i < V.size(); ++i) {
+          for (size_t j = 0; j < i; ++j) {
+            ComplexD o = innerProduct(V[j], V[i]);
+            axpy(V[i], -o, V[j], V[i]);
+          }
+          RealD nn = std::sqrt(norm2(V[i]));
+          V[i] = V[i] * (1.0 / nn);
+        }
+        std::cout << GridLogMessage << "== SOLVE-DEFLATE: invert D_W x=b, count outer iters (deflation dim="
+                  << V.size() << ", restart=" << srst << ") ==" << std::endl;
+        LatticeFermionD b(UGrid);
+        gaussian(RNG, b);
+        RealD stol = 1.0e-8;
+        int smaxit = 20000;
+        NonHermitianLinearOperator<WilsonFermionD, LatticeFermionD> LinOp(Dwsp);
+
+        // RB-CGNE honest baseline
+        ConjugateGradient<LatticeFermionD> CGrb(stol, smaxit, false);
+        SchurRedBlackDiagMooeeSolve<LatticeFermionD> Schur(CGrb);
+        LatticeFermionD xrb(UGrid);
+        xrb = Zero();
+        Schur(Dwsp, b, xrb);
+        int rb_it = CGrb.IterationsToComplete;
+
+        // Mx (scale-mixed): the M1 correction band-limited to |sin p| < mx_acut (sweet spot ~0.7). INNER
+        // (exact, +D_free) and OUTER (cheap). Fed to the same FGMRES + deflation.
+        double mx_acut = 0.7;
+        if (GridCmdOptionExists(argv, argv + argc, "--mx-acut")) {
+          mx_acut = std::stod(GridCmdOptionPayload(argv, argv + argc, "--mx-acut"));
+        }
+        WilsonImplD::ImplParams pfree(bnd);
+        WilsonFermionD Dfree(Uunit, *UGrid, *UrbGrid, mprec, pfree);
+        Ffo.build_bandmask(mx_acut, false, 0.3);
+        FreeLimitPreconditionerWx<WilsonImplD> MxIn(Ffo, xform, Dframed, Dfree, UGrid, true);
+        FreeLimitPreconditionerWx<WilsonImplD> MxOut(Ffo, xform, Dframed, Dfree, UGrid, false);
+
+        DeflatedPrec M0d(M0L, Dwsp, V, UGrid);
+        DeflatedPrec M1d(M1L, Dwsp, V, UGrid);
+        DeflatedPrec Mxd(MxIn, Dwsp, V, UGrid);
+        int it_m0 = run_fgmres(LinOp, M0L, b, stol, smaxit, srst);
+        int it_m1 = run_fgmres(LinOp, M1L, b, stol, smaxit, srst);
+        int it_mxi = run_fgmres(LinOp, MxIn, b, stol, smaxit, srst);
+        int it_mxo = run_fgmres(LinOp, MxOut, b, stol, smaxit, srst);
+        int it_m0d = run_fgmres(LinOp, M0d, b, stol, smaxit, srst);
+        int it_m1d = run_fgmres(LinOp, M1d, b, stol, smaxit, srst);
+        int it_mxd = run_fgmres(LinOp, Mxd, b, stol, smaxit, srst);
+
+        std::cout << GridLogMessage << "  --- outer iteration counts (tol=" << stol
+                  << ", Mx |sin p| cut=" << mx_acut << ") ---" << std::endl;
+        std::cout << GridLogMessage << "  RB-CGNE (baseline)     iters=" << rb_it << std::endl;
+        std::cout << GridLogMessage << "  FGMRES(M0)             iters=" << it_m0 << std::endl;
+        std::cout << GridLogMessage << "  FGMRES(M1)             iters=" << it_m1
+                  << "   [+1 D_W[U^L]/apply]" << std::endl;
+        std::cout << GridLogMessage << "  FGMRES(MxIn)           iters=" << it_mxi
+                  << "   [+1 D_W[U^L] +1 D_free +1 FFT-pair/apply]" << std::endl;
+        std::cout << GridLogMessage << "  FGMRES(MxOut)          iters=" << it_mxo
+                  << "   [+1 D_W[U^L] +1 FFT-pair/apply]" << std::endl;
+        std::cout << GridLogMessage << "  FGMRES(M0 + deflation) iters=" << it_m0d
+                  << "   [+1 D_W/apply]" << std::endl;
+        std::cout << GridLogMessage << "  FGMRES(M1 + deflation) iters=" << it_m1d
+                  << "   [+2 D_W/apply]" << std::endl;
+        std::cout << GridLogMessage << "  FGMRES(MxIn + deflation) iters=" << it_mxd
+                  << "   [MxIn +1 D_W/apply]" << std::endl;
+      }
+      // (5) DEFLATED-SUBSPACE FRAME OPT (--deflate-frameopt, user experiment 2026-09-05): determine Omega by
+      // descending the M0 L2 loss L=sum||M0(Omega)D_W phi - phi||^2 ONLY on the chiral zero modes (the
+      // deflated subspace the IRA found), then build BOTH M0 and M1 from that Omega and compare their action
+      // on every mode vs the Landau frame. Probes = |chi|>0.5 modes. (M0-loss gradient is the validated
+      // fo_loss_force; M1-loss would need the extra gauge-covariant force through U^L(Omega) -- deferred.)
+      if (GridCmdOptionExists(argv, argv + argc, "--deflate-frameopt")) {
+        int df_iter = 200;
+        double df_eta = 0.1;
+        if (GridCmdOptionExists(argv, argv + argc, "--df-iter")) {
+          df_iter = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--df-iter"));
+        }
+        if (GridCmdOptionExists(argv, argv + argc, "--df-eta")) {
+          df_eta = std::stod(GridCmdOptionPayload(argv, argv + argc, "--df-eta"));
+        }
+        std::vector<LatticeFermionD> vlist, wlist;
+        for (size_t k = 0; k < rr_mode.size(); ++k) {
+          if (std::abs(rr_chi[k]) > 0.5) {
+            LatticeFermionD wv(UGrid);
+            Dwsp.M(rr_mode[k], wv);
+            vlist.push_back(rr_mode[k]);
+            wlist.push_back(wv);
+          }
+        }
+        std::cout << GridLogMessage << "== DEFLATE-FRAMEOPT: descend M0 L2 loss on " << vlist.size()
+                  << " chiral zero modes (df_iter=" << df_iter << " df_eta=" << df_eta << ") ==" << std::endl;
+        LatticeColourMatrixD Omopt(UGrid);
+        Omopt = xform;
+        fo_descend(Ffo, Omopt, wlist, vlist, df_iter, df_eta, 25);
+
+        // build M0, M1 from the optimized frame (M1 needs U^L rebuilt on Omopt)
+        FreeLimitPreconditionerW<WilsonImplD> M0opt(Ffo, Omopt, UGrid);
+        LatticeGaugeFieldD UframedOpt(UGrid);
+        UframedOpt = U;
+        LatticeColourMatrixD gopt(UGrid);
+        gopt = Omopt;
+        SU<Nc>::GaugeTransform<PeriodicGimplD>(UframedOpt, gopt);
+        WilsonFermionD DframedOpt(UframedOpt, *UGrid, *UrbGrid, mprec, p1);
+        FreeLimitPreconditionerW1<WilsonImplD> M1opt(Ffo, Omopt, DframedOpt, UGrid);
+
+        std::cout << GridLogMessage
+                  << "-- COMPARE |M D_W phi|/|phi| (1=perfect): M0/M1 with Landau vs deflate-opt Omega --"
+                  << std::endl;
+        LatticeFermionD Dphi(UGrid), t(UGrid);
+        for (size_t k = 0; k < rr_mode.size(); ++k) {
+          Dwsp.M(rr_mode[k], Dphi);
+          M0L(Dphi, t);
+          RealD r0L = std::sqrt(norm2(t));
+          M0opt(Dphi, t);
+          RealD r0O = std::sqrt(norm2(t));
+          M1L(Dphi, t);
+          RealD r1L = std::sqrt(norm2(t));
+          M1opt(Dphi, t);
+          RealD r1O = std::sqrt(norm2(t));
+          RealD lam = std::sqrt(real(rr_lam[k]) * real(rr_lam[k]) + imag(rr_lam[k]) * imag(rr_lam[k]));
+          std::cout << GridLogMessage << "  CMP[" << k << "]  |lam|=" << lam << "  chi=" << rr_chi[k]
+                    << "  M0_landau=" << r0L << "  M0_opt=" << r0O
+                    << "  M1_landau=" << r1L << "  M1_opt=" << r1O << std::endl;
         }
       }
       Grid_finalize();
