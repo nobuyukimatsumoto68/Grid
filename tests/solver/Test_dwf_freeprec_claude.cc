@@ -630,8 +630,12 @@ int main(int argc, char** argv) {
               << "  |diff|=" << std::fabs(plaqr - rheader.plaquette) << std::endl;
     bool full_spectrum = GridCmdOptionExists(argv, argv + argc, "--full-spectrum");
     gate3b = nersc_crosscheck(Ureal, evalfile, UGrid, UrbGrid, M5, boundary, full_spectrum);
+    // Frame flow moved to s/t0=1.0 (frame tau = t0 = 2.91; nstep=146 at eps=0.02; flowed plaq ~0.9990).
+    // The flow-time scan showed the old tau=2 (nstep=100, s/t0=0.69) sat right on the hard-config cliff,
+    // and s/t0~0.9 has an occasional Landau gauge-fix dropout, whereas s/t0=1.0 is clean for all configs;
+    // see scripts_nm/freeprec_frame_scan_claude.md. Old value: 0.02, 100.
     run_headline("NERSC SU(3) beta6 -- HEADLINE", Ureal, UGrid, UrbGrid, FGrid, FrbGrid,
-                 Ls, M5, bb, cc, mm, boundary, 0.02, 100, RNG5, run_cgne, run_m0, run_m1);
+                 Ls, M5, bb, cc, mm, boundary, 0.02, 146, RNG5, run_cgne, run_m0, run_m1);
   }
 
   bool pass = (maxerr0a < 1e-10) && (maxrel0b < 1e-4) && gate1 && gate2 && gate3b;

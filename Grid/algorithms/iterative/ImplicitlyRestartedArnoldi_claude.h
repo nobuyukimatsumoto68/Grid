@@ -93,7 +93,7 @@ public:
     int n = (int)theta.size();
     std::vector<std::pair<double, int> > key(n);
     for (int i = 0; i < n; ++i) {
-      double m = std::abs(theta[i]);
+      double m = std::hypot(theta[i].real(), theta[i].imag());  // |theta| (nvcc-safe: no std::abs(complex))
       double k = (sortcrit == IRAsmallestModulus) ? m : (-m);
       key[i] = std::make_pair(k, i);
     }
@@ -126,7 +126,8 @@ public:
     // second pass (reorthogonalization); fold the correction into H(i,k)
     for (int i = 0; i <= k; ++i) {
       ComplexD dip = innerProduct(evec[i], w);
-      H(i, k) = H(i, k) + dip;
+      ComplexD hcur = H(i, k);        // Eigen complex -> ComplexD (avoid mixed Eigen/Grid complex add under nvcc)
+      H(i, k) = hcur + dip;
       w = w - dip * evec[i];
     }
 
@@ -155,7 +156,10 @@ public:
     evalMaxApprox = 0.0;
     for (int i = 0; i < Nm; ++i) {
       theta[i] = es.eigenvalues()(i);
-      evalMaxApprox = std::max(evalMaxApprox, std::abs(theta[i]));
+      double mi = std::hypot(theta[i].real(), theta[i].imag());  // nvcc-safe |theta|
+      if (mi > evalMaxApprox) {
+        evalMaxApprox = mi;
+      }
     }
     std::vector<int> idx = rank_ritz(theta);  // WANTED = idx[0..Nk-1], UNWANTED = idx[Nk..Nm-1] as shifts
 
@@ -220,7 +224,7 @@ public:
     int nconv = 0;
     for (int s = 0; s < Nstop; ++s) {
       int i = idxk[s];
-      RealD rr = beta_m * std::abs(Yblock(Nk - 1, i));
+      RealD rr = beta_m * std::hypot(Yblock(Nk - 1, i).real(), Yblock(Nk - 1, i).imag());  // nvcc-safe
       RealD rrel = rr / scale;
       std::cout << GridLogMessage << "  IRA Ritz[" << std::setw(3) << s << "] = " << eval2[i]
                 << "   |resid|/rho = " << rrel << "   target " << eresid
