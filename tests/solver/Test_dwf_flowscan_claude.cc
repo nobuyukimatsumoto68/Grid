@@ -28,7 +28,8 @@ using namespace Grid;
 // FGMRES Krylov RestartLength. FILE-SCOPE (idiom of Test_dwf_freeprec_claude.cc:68): the --fgmres_restart
 // parse in main() previously wrote to a variable that only existed inside run_flowscan -> did not compile
 // (the knob was added after the last GPU rebuild). Default 256 = effectively no-restart.
-static int g_fgmres_restart = 256;
+static int g_fgmres_restart = 20;  // FGMRES restart length; default 20 (Nobu 2026-09-07, low-memory
+                                   // production setting; was 256 = no-restart). --fgmres_restart overrides.
 
 // Landau gauge-fix iteration cap. FILE-SCOPE + CLI (--gf_maxit) because 1000 UNDER-CONVERGES on
 // longer-flow / harder frames: dmuAmu stalls at O(10^2) (target 1e-12) and the M0 win is then an

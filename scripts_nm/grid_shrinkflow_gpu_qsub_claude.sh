@@ -67,7 +67,7 @@ QSQFLAG=""
 if [ "${QSQUEEZE}" = "1" ]; then QSQFLAG="--qsqueeze --qn ${QNLIST}"; fi
 OPS=${OPS:-cgne,m0}
 TOL=${TOL:-1e-6}
-RESTART=${RESTART:-256}
+RESTART=${RESTART:-20}
 GFMAXIT=${GFMAXIT:-3000}
 # Grid log channels. Iterative -> per-iteration FGMRES(M0)/CG progress. Drop it for quiet.
 LOGCH=${LOGCH:-Message,Error,Warning}

@@ -7,6 +7,7 @@
 #include <Grid/Grid.h>
 #include <Grid/qcd/utils/FreeWilson_claude.h>
 #include <Grid/qcd/utils/FreeWilsonTwisted_claude.h>
+#include <Grid/qcd/utils/QSqueezeFlowAction_claude.h>
 #include <Grid/algorithms/iterative/ImplicitlyRestartedArnoldi_claude.h>
 #include <Grid/algorithms/iterative/ChebyshevEllipse_claude.h>
 #include <sstream>
@@ -633,7 +634,7 @@ int main(int argc, char** argv) {
   if (GridCmdOptionExists(argv, argv + argc, "--mass")) {
     mass = std::stod(GridCmdOptionPayload(argv, argv + argc, "--mass"));
   }
-  int restart = 80;
+  int restart = 20;  // FGMRES restart length default (Nobu 2026-09-07); --restart overrides
   if (GridCmdOptionExists(argv, argv + argc, "--restart")) {
     restart = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--restart"));
   }
@@ -1331,6 +1332,116 @@ int main(int argc, char** argv) {
         xg = Zero();
         FG(LinOp, bsrc, xg);
         std::cout << GridLogMessage << "  FGMRES(M0, JOINT Omega+theta frame): iters="
+                  << FG.IterationCount << std::endl;
+      }
+      Grid_finalize();
+      return 0;
+    }
+
+    // ---- Q-FRAME (--qframe, Nobu 2026-09-07): q^n-flow the ORIGINAL config (NO Wilson flow) to a config
+    // U^q with the topological deficit LOCALISED to ~1 site; frame-optimise Omega on D_W(U^q) (where the
+    // lump is measure-zero in the volume-summed loss -> the optimiser finds the clean BULK frame,
+    // undistracted by the spread lump); then use that Omega to precondition the ORIGINAL D_W(U). Compare
+    // FGMRES(M0) on D_W(U) for: Landau(U) frame, Omega opt on U^q. ----
+    if (GridCmdOptionExists(argv, argv + argc, "--qframe")) {
+      double mprec = mass;
+      if (GridCmdOptionExists(argv, argv + argc, "--mprec")) {
+        mprec = std::stod(GridCmdOptionPayload(argv, argv + argc, "--mprec"));
+      }
+      int qn = 6;
+      if (GridCmdOptionExists(argv, argv + argc, "--qn")) {
+        qn = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--qn"));
+      }
+      int qnstep = 2000;
+      if (GridCmdOptionExists(argv, argv + argc, "--qflow-nstep")) {
+        qnstep = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--qflow-nstep"));
+      }
+      double qeps = 0.4;
+      if (GridCmdOptionExists(argv, argv + argc, "--qflow-eps")) {
+        qeps = std::stod(GridCmdOptionPayload(argv, argv + argc, "--qflow-eps"));
+      }
+      int nprobe = 4;
+      if (GridCmdOptionExists(argv, argv + argc, "--fo-probes")) {
+        nprobe = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--fo-probes"));
+      }
+      int fo_iter = 60;
+      if (GridCmdOptionExists(argv, argv + argc, "--fo-iter")) {
+        fo_iter = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--fo-iter"));
+      }
+      double fo_eta = 0.1;
+      if (GridCmdOptionExists(argv, argv + argc, "--fo-eta")) {
+        fo_eta = std::stod(GridCmdOptionPayload(argv, argv + argc, "--fo-eta"));
+      }
+      std::vector<Complex> bnd(Nd, Complex(1.0, 0.0));
+      bnd[Nd - 1] = Complex(-1.0, 0.0);
+
+      // U^q = q^n flow of the ORIGINAL U (pure ||q||_n force, NO Wilson smoothing)
+      std::cout << GridLogMessage << "==== qframe: q^" << qn << " flow (eps=" << qeps << " nstep="
+                << qnstep << ") of the ORIGINAL config -> U^q ====" << std::endl;
+      LatticeGaugeFieldD Uq(UGrid);
+      Uq = U;
+      QSqueezeGaugeAction<PeriodicGimplD> QSG(qn);
+      WilsonFlow<PeriodicGimplD> qwf(qeps, qnstep);
+      qwf.setGaugeAction(&QSG);
+      {
+        LatticeGaugeFieldD Utmp(UGrid);
+        qwf.smear(Utmp, Uq);
+        Uq = Utmp;
+      }
+      Real plaqU = WilsonLoops<PeriodicGimplD>::avgPlaquette(U);
+      Real plaqUq = WilsonLoops<PeriodicGimplD>::avgPlaquette(Uq);
+      std::cout << GridLogMessage << "  plaq(U)=" << plaqU << "  plaq(U^q)=" << plaqUq
+                << " (bulk should be ~unchanged)" << std::endl;
+
+      // Landau frame of U^q -> warm-start Omega
+      LatticeColourMatrixD OmQ(UGrid);
+      {
+        LatticeGaugeFieldD Uqcopy(UGrid);
+        Uqcopy = Uq;
+        FourierAcceleratedGaugeFixer<PeriodicGimplD>::SteepestDescentGaugeFix(
+            Uqcopy, OmQ, 0.1 / 16.0, 3000, 1.0e-12, 1.0e-12, true, -1, false);
+      }
+
+      // probes from D_W(U^q): w = D_W(U^q) v
+      WilsonImplD::ImplParams pq(bnd);
+      WilsonFermionD Dwq(Uq, *UGrid, *UrbGrid, mass, pq);
+      std::vector<LatticeFermionD> vlist, wlist;
+      for (int p = 0; p < nprobe; ++p) {
+        LatticeFermionD vv(UGrid), ww(UGrid);
+        gaussian(RNG, vv);
+        Dwq.M(vv, ww);
+        vlist.push_back(vv);
+        wlist.push_back(ww);
+      }
+
+      FreeWilsonInverse<WilsonImplD> Ffo(UGrid, mprec, bnd);
+      std::cout << GridLogMessage << "  L(Landau(U^q) frame, on U^q probes) = "
+                << fo_loss(Ffo, OmQ, wlist, vlist) << std::endl;
+      LatticeColourMatrixD OmOpt = OmQ;
+      fo_descend(Ffo, OmOpt, wlist, vlist, fo_iter, fo_eta, 25);
+
+      // precondition the ORIGINAL D_W(U): compare Landau(U) vs the U^q-optimised frame
+      WilsonImplD::ImplParams pfo(bnd);
+      WilsonFermionD Dwu(U, *UGrid, *UrbGrid, mass, pfo);
+      NonHermitianLinearOperator<WilsonFermionD, LatticeFermionD> LinOpU(Dwu);
+      LatticeFermionD bsrc(UGrid), xg(UGrid);
+      gaussian(RNG, bsrc);
+      RealD tol = 1.0e-8;
+      int maxit = 20000;
+      {
+        FreeLimitPreconditionerW<WilsonImplD> M0L(Ffo, xform, UGrid);  // Landau(flowed U) baseline
+        FlexibleGeneralisedMinimalResidual<LatticeFermionD> FG(tol, maxit, M0L, restart, false);
+        xg = Zero();
+        FG(LinOpU, bsrc, xg);
+        std::cout << GridLogMessage << "  FGMRES(M0, Landau(U) frame) on D(U):     iters="
+                  << FG.IterationCount << std::endl;
+      }
+      {
+        FreeLimitPreconditionerW<WilsonImplD> M0Q(Ffo, OmOpt, UGrid);  // frame optimised on U^q
+        FlexibleGeneralisedMinimalResidual<LatticeFermionD> FG(tol, maxit, M0Q, restart, false);
+        xg = Zero();
+        FG(LinOpU, bsrc, xg);
+        std::cout << GridLogMessage << "  FGMRES(M0, U^q-optimised frame) on D(U): iters="
                   << FG.IterationCount << std::endl;
       }
       Grid_finalize();

@@ -13,6 +13,7 @@
 
 #include <Grid/Grid.h>
 #include <Grid/qcd/utils/FreeMobius5D_claude.h>
+#include <Grid/algorithms/iterative/RecyclingGeneralisedMinimalResidual_claude.h>  // GMRES-DR / GCRO-DR
 
 #include <array>
 #include <vector>
@@ -65,20 +66,33 @@ public:
 // Peter Boyle's window scan (harder regime): no-restart 233 iters -> window-128 829 -> window-32 3353 ->
 // window-16 unconverged. My 8^4 m=0.1 sweep (restart 32 = only +15% iters) was too EASY to see this; do
 // NOT restart. (Memory is the real cost of no-restart; the MG smoother-slot build is what removes it.)
-static int g_fgmres_restart = 256;
+static int g_fgmres_restart = 20;  // FGMRES restart length; default 20 (Nobu 2026-09-07, low-memory
+                                   // production setting; was 256 = no-restart -> OOM at 24^4). --restart overrides.
 static bool g_run_bcg = false;
 static bool g_run_rbcgne = true;  // RB-CGNE (honest baseline) -- default ON; --ops "rb"=RB-only, "cgne"=full+RB
+// Frame Wilson-flow (build Omega) + Landau gauge-fix cap. DEFAULT s/t0=6 = nstep 873 at eps 0.02, t0=2.91
+// (Nobu 2026-09-07: the OPTIMAL Wilson frame -- the flow-time scan win plateaus at s/t0~6-10, above the
+// old s/t0=1 default). gf_maxit RAISED to 4000: 1000 UNDER-CONVERGES the Landau fix at this longer flow
+// (dmuAmu stalls O(1e2); seen in the flowscan). All three overridable: --flow_eps/--flow_nstep/--gf_maxit.
+static double g_flow_eps = 0.02;
+static int g_flow_nstep = 873;
+static int g_gf_maxit = 4000;
 static int g_repeat = 1;          // --repeat N: re-solve each solve N times, report the MIN wall (single-solve wall fluctuates)
 static double g_mprec = 1.0e30;   // --mprec M: build the free-prec (M0) at DW mass M != operator mass (Tikhonov scan); 1e30 = matched
 static double g_m5prec = 1.0e30;  // --m5prec M5: build the free-prec at Wilson-kernel M5 != operator M5 (2D mass-shift scan); 1e30 = matched
 static std::vector<int> g_restart_sweep;  // if set (--restart-sweep a,b,c), FGMRES solves each back-to-back
+static int g_deflate_k = 24;  // deflation dim k for GMRES-DR/GCRO-DR (--deflate-k); pairs with --restart (m).
+                              // Restart-N scan on 640 puts the plain-GMRES knee at window ~80 -> expect
+                              // k ~ 40-80 to bring restart-20 near the no-restart floor. --deflate-sweep scans.
+static std::vector<int> g_deflate_sweep;   // --deflate-sweep a,b,c : GMRES-DR at each k back-to-back
 
 static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
                          GridCartesian* UGrid, GridRedBlackCartesian* UrbGrid,
                          GridCartesian* FGrid, GridRedBlackCartesian* FrbGrid,
-                         int Ls, double M5, double bb, double cc, double mm,
+                         int Ls, double M5, double bb, double cc, const std::vector<double>& masses,
                          std::vector<Complex> boundary, double flow_eps, int flow_nstep,
-                         GridParallelRNG& RNG5, bool run_cgne, bool run_m0, bool run_m1) {
+                         GridParallelRNG& RNG5, bool run_cgne, bool run_m0, bool run_m1,
+                         bool run_gmresdr = false, bool run_gcrodr = false) {
   std::cout << "==== headline: FGMRES(M0) vs CGNE D_W-count  [" << tag << "] ====" << std::endl;
 
   Real plaq0 = WilsonLoops<PeriodicGimplD>::avgPlaquette(U);
@@ -97,7 +111,7 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
   // (~0.586 at L=8 vs 2.0 at L=4), so the FA fixer needs MORE iters at larger volume. 1000 is generous
   // insurance (the alpha=0.00625 step is stable/monotone, so extra iters only converge further); watch
   // the printed dmuAmu/functional plateau to confirm convergence.
-  int gf_maxit = 1000;
+  int gf_maxit = g_gf_maxit;  // default 4000 (needed to converge Landau at the s/t0=6 frame)
   FourierAcceleratedGaugeFixer<PeriodicGimplD>::SteepestDescentGaugeFix(
       Uflowed, xform, gf_alpha, gf_maxit, 1.0e-12, 1.0e-12, /*Fourier=*/true, /*orthog=*/-1,
       /*err_on_no_converge=*/false);
@@ -111,6 +125,12 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
             << "  flowed-fixed Landau functional=" << landau << "  Q(orig)=" << Q
             << "  Q_5Li(frame-flowed tau=" << (flow_eps * flow_nstep) << ")=" << Qflow << std::endl;
 
+  // MASS LOOP: the frame (flow + Landau -> Uflowed, xform above) is mass-INDEPENDENT, built ONCE per
+  // config and reused for every mass (Nobu 2026-09-07: don't separate the masses into distinct jobs).
+  // Only D / free-kernel / M0 / solves below depend on the mass.
+  for (size_t im = 0; im < masses.size(); ++im) {
+  double mm = masses[im];
+  std::cout << "  ======== mass m = " << mm << "  (frame reused) ========" << std::endl;
   WilsonImplD::ImplParams Params(boundary);
   MobiusFermionD D(U, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
   // preconditioner (free-prec) mass: --mprec M builds M0 at DW mass M != operator mm (Tikhonov scan);
@@ -129,7 +149,7 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
   gaussian(RNG5, bsrc);
   RealD solve_tol = 1.0e-8;
   int solve_maxit = 20000;  // generous headroom for small-m (m=0.01) baselines (kappa ~ 1/m)
-  int fgmres_restart = 256;  // no-restart: RestartLength >> expected iters, not literally maxit (OOM)
+  int fgmres_restart = g_fgmres_restart;  // track the global default/CLI (default 20); used by the M1 solve
 
   // LinOp on the ORIGINAL operator D, shared by the M0 and M1 FGMRES solves.
   NonHermitianLinearOperator<MobiusFermionD, LatticeFermionD> LinOp(D);
@@ -259,6 +279,57 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
     }
   }
 
+  if (run_gmresdr || run_gcrodr) {
+    // DEFLATED / RECYCLING GMRES right-preconditioned by M0 (RecyclingGeneralisedMinimalResidual_claude.h).
+    // Fixes the restart-20 stall (sec 8) by deflating M0 D_DW's near-null cluster. GMRES-DR = deflated
+    // restart (recycle OFF); GCRO-DR = recycle space persists across solves (recycle ON). Currency:
+    // D_W applies = Ls * iters (one M0 apply + one D apply per Arnoldi step), same as FGMRES(M0).
+    // 2D (m,k) scan: --restart-sweep m1,m2,... (restart window) x --deflate-sweep k1,k2,... (saved low
+    // modes), each pair BACK-TO-BACK on the same frame. Empty sweep -> single value (--restart / --deflate-k).
+    std::vector<int> mvals = g_restart_sweep.empty() ? std::vector<int>({g_fgmres_restart}) : g_restart_sweep;
+    std::vector<int> kvals = g_deflate_sweep.empty() ? std::vector<int>({g_deflate_k}) : g_deflate_sweep;
+    bool recycle = run_gcrodr;   // GMRES-DR (false) vs GCRO-DR (true)
+    for (size_t mi = 0; mi < mvals.size(); ++mi) {
+    int mrestart = mvals[mi];
+    for (size_t ki = 0; ki < kvals.size(); ++ki) {
+      int kk = kvals[ki];
+      M0.reset_timers();
+      RecyclingGeneralisedMinimalResidual<LatticeFermionD> RGM(solve_tol, solve_maxit, M0,
+                                                              mrestart, kk, recycle,
+                                                              /*err_on_no_conv=*/false);
+      LatticeFermionD xg(FGrid);
+      int rg_iters = 0;
+      double tw_rg_min = 1.0e30;
+      for (int rep = 0; rep < g_repeat; ++rep) {
+        xg = Zero();
+        M0.reset_timers();
+        double tw = -usecond();
+        RGM(LinOp, bsrc, xg);
+        tw += usecond();
+        rg_iters = RGM.IterationCount;
+        if (tw < tw_rg_min) {
+          tw_rg_min = tw;
+        }
+      }
+      long dW_rgm = (long)Ls * rg_iters;
+      const char* variant = recycle ? "GCRO-DR" : "GMRES-DR";
+      std::cout << "  " << variant << "(m=" << mrestart << ",k=" << kk << "): iters=" << rg_iters
+                << "  M0 applies=" << M0.n_apply << "  D_W applies=" << dW_rgm
+                << "  WALL(min of " << g_repeat << ")=" << tw_rg_min / 1.0e6 << " s" << std::endl;
+      if (dW_rbcgne > 0) {
+        double speedup_rb = (dW_rgm > 0) ? (double)dW_rbcgne / (double)dW_rgm : 0.0;
+        std::cout << "  D_W-apply speedup (RB-CGNE / " << variant << ") = " << speedup_rb
+                  << "x  [count, M0-free]" << std::endl;
+      }
+      if (wall_rbcgne > 0.0) {
+        double wall_speedup_rb = (tw_rg_min > 0.0) ? wall_rbcgne / tw_rg_min : 0.0;
+        std::cout << "  WALL speedup (RB-CGNE / " << variant << ") = " << wall_speedup_rb
+                  << "x  [HONEST -- >1 = free-prec wins wall]" << std::endl;
+      }
+    }  // k loop
+    }  // m loop (2D scan)
+  }
+
   if (g_run_bcg) {
     // BiCGSTAB right-preconditioned by M0 (short recurrence, NO orthogonalization; ~2 M0 applies/iter).
     // Solve (D M0) y = b, then x = M0 y. Compare WALL to FGMRES: BiCGSTAB drops the O(iters^2)
@@ -311,6 +382,7 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
                 << dW_fgmres1 << ")" << std::endl;
     }
   }
+  }  // mass loop (frame reused across masses)
 }
 
 // 4^4 bit-exact gate: build D_W(-M5) (mass-normalized, AP-time) on the loaded config, form the dense
@@ -574,6 +646,21 @@ int main(int argc, char** argv) {
     mm = std::stod(GridCmdOptionPayload(argv, argv + argc, "--mass"));
   }
   std::cout << "==== headline mass m = " << mm << " ====" << std::endl;
+  // --mass-list "0.1,0.01,0.001": loop these masses over the SINGLE (mass-independent) frame per config.
+  // Default = {--mass}. (mm above still sets the gate-0 physics point.)
+  std::vector<double> masses;
+  if (GridCmdOptionExists(argv, argv + argc, "--mass-list")) {
+    std::stringstream mss(GridCmdOptionPayload(argv, argv + argc, "--mass-list"));
+    std::string mtok;
+    while (std::getline(mss, mtok, ',')) {
+      if (!mtok.empty()) {
+        masses.push_back(std::stod(mtok));
+      }
+    }
+  }
+  if (masses.empty()) {
+    masses.push_back(mm);
+  }
   std::vector<Complex> boundary = {1, 1, 1, -1};  // anti-periodic time
   MobiusFermionD::ImplParams Params(boundary);
   MobiusFermionD Dfree(Umu, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
@@ -615,6 +702,8 @@ int main(int argc, char** argv) {
   bool run_cgne = true;
   bool run_m0 = true;
   bool run_m1 = true;
+  bool run_gmresdr = false;   // deflated-restart GMRES (GMRES-DR) on M0; OFF unless named in --ops
+  bool run_gcrodr = false;    // recycling GMRES (GCRO-DR) on M0; OFF unless named in --ops
   if (GridCmdOptionExists(argv, argv + argc, "--ops")) {
     std::string ops = GridCmdOptionPayload(argv, argv + argc, "--ops");
     run_cgne = (ops.find("cgne") != std::string::npos);
@@ -624,6 +713,19 @@ int main(int argc, char** argv) {
     run_m0 = (ops.find("m0") != std::string::npos);
     run_m1 = (ops.find("m1") != std::string::npos);
     g_run_bcg = (ops.find("bcg") != std::string::npos);  // BiCGSTAB(M0) A/B vs FGMRES
+    run_gmresdr = (ops.find("gmresdr") != std::string::npos);
+    run_gcrodr = (ops.find("gcrodr") != std::string::npos);
+    // deflated variants need the RB-CGNE baseline for their ratio -- turn it on regardless.
+    if (run_gmresdr || run_gcrodr) {
+      g_run_rbcgne = true;
+    }
+  }
+  // --deflate-k K : deflation dim for GMRES-DR/GCRO-DR. --deflate-sweep k1,k2,... : each k back-to-back.
+  if (GridCmdOptionExists(argv, argv + argc, "--deflate-k")) {
+    g_deflate_k = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--deflate-k"));
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--deflate-sweep")) {
+    GridCmdOptionIntVector(GridCmdOptionPayload(argv, argv + argc, "--deflate-sweep"), g_deflate_sweep);
   }
   // outer-solver knob: --restart N sets the FGMRES restart length (default 256 = no-restart). Lower N
   // caps the O(iters^2) orthogonalization at the cost of possibly more iterations.
@@ -641,6 +743,15 @@ int main(int argc, char** argv) {
   }
   if (GridCmdOptionExists(argv, argv + argc, "--restart")) {
     g_fgmres_restart = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--restart"));
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--flow_nstep")) {
+    g_flow_nstep = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--flow_nstep"));
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--flow_eps")) {
+    g_flow_eps = std::stod(GridCmdOptionPayload(argv, argv + argc, "--flow_eps"));
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--gf_maxit")) {
+    g_gf_maxit = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--gf_maxit"));
   }
   // --restart-sweep a,b,c : FGMRES solves at each restart length back-to-back (same frame, pins optimum).
   if (GridCmdOptionExists(argv, argv + argc, "--restart-sweep")) {
@@ -699,7 +810,7 @@ int main(int argc, char** argv) {
     LatticeGaugeFieldD Uh(UGrid);
     SU<Nc>::HotConfiguration(RNG4, Uh);
     run_headline("Hot config -- shakeout", Uh, UGrid, UrbGrid, FGrid, FrbGrid,
-                 Ls, M5, bb, cc, mm, boundary, 0.02, 100, RNG5, run_cgne, run_m0, run_m1);
+                 Ls, M5, bb, cc, masses, boundary, 0.02, 100, RNG5, run_cgne, run_m0, run_m1);
   }
 
   // ---------- chunk 3b: NERSC config cross-check + headline (only if --config <nersc-file> given) ----------
@@ -724,7 +835,8 @@ int main(int argc, char** argv) {
     // and s/t0~0.9 has an occasional Landau gauge-fix dropout, whereas s/t0=1.0 is clean for all configs;
     // see scripts_nm/freeprec_frame_scan_claude.md. Old value: 0.02, 100.
     run_headline("NERSC SU(3) beta6 -- HEADLINE", Ureal, UGrid, UrbGrid, FGrid, FrbGrid,
-                 Ls, M5, bb, cc, mm, boundary, 0.02, 146, RNG5, run_cgne, run_m0, run_m1);
+                 Ls, M5, bb, cc, masses, boundary, g_flow_eps, g_flow_nstep, RNG5, run_cgne, run_m0, run_m1,
+                 run_gmresdr, run_gcrodr);
   }
 
   bool pass = (maxerr0a < 1e-10) && (maxrel0b < 1e-4) && gate1 && gate2 && gate3b;

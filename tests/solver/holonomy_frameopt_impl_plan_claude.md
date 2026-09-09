@@ -14,8 +14,24 @@ B DONE + compiles; chunk C (run) in progress.**
   adapter (Omega^dag F_theta Omega) for the FGMRES win. Wired as --frameopt --opt_theta [--theta-eta].
   Also guarded a pre-existing --save-modes ScidacWriter block with #ifdef HAVE_LIME (merged CPU build
   has no LIME). Compiles on build_mpi_merged.
-- C: functional test running on 747 (--frameopt --opt_theta). Compare L(Landau,theta=0) vs joint
-  (Omega,theta), and FGMRES iters Landau vs Omega-only vs joint.
+- C DONE (2026-09-07, GPU jobs 7488288/747, 7488289/640, m=0.1, flow t0, 4 probes, fo_iter 60):
+  RESULT = NULL. The constant holonomy twist does NOT help.
+    640 (Q=-3): L Landau 4.886e5 -> Omega-only 3.810e5 (1.28x) -> joint 3.809e5; FGMRES 60/58/58.
+    747 (Q=0) : L Landau 4.939e5 -> Omega-only 3.844e5 (1.29x) -> joint 3.843e5; FGMRES 63/60/60.
+  Optimizer found nonzero theta (~0.01-0.09) but it lowers L by ~0.02-0.03% over Omega-only and changes
+  FGMRES by 0. CONFIRMS the conjugation-invariance argument QUANTITATIVELY: the frame faces the ORIGINAL
+  config's holonomy (mean~0, spatially DISORDERED); a CONSTANT (FFT-diagonal) twist can only match the
+  ~0 average -> nearly worthless. Also: Omega-only frame-opt itself only buys 1.28x lower L and 2 fewer
+  FGMRES iters over Landau -> the frame is already near-optimal for the WIN. Neither Omega-refinement nor
+  theta moves the win. => the win floor is NOT frame-addressable (consistent with the whole session).
+  Infra kept (FreeWilsonTwisted_claude.h, --opt_theta, GPU build+qsub) for reuse/reference.
+
+Q-FRAME (--qframe, Nobu 2026-09-07): q^n-flow ORIGINAL U (no Wilson) -> U^q (deficit localized to ~1
+site, measure-zero in the loss); fo_descend Omega on D_W(U^q); precondition D_W(U). Added to
+Test_wilson_frameopt_claude.cc + grid_wilson_qframe_gpu_qsub_claude.sh. First 640 run OVER-SQUEEZED
+(eps0.4 x 2000 = tau800 >> fall-through; cloverleaf E 1.26e6, clover Q -3->-0.44, U^q singular). NOT
+pursued: the ~0.38 floor is GENERIC (same at Q=0), so localizing the topological deficit cannot address
+it. FRAME SIDE CLOSED -- see [[project-holonomy-floor]]. Next = operator/spectrum (deflation / double-precond).
 
 
 Goal (Nobu 2026-09-07): add the CONSTANT holonomy twist theta_mu^(c) to the set of variables optimized

@@ -44,7 +44,7 @@ FOPROBES=${FOPROBES:-4}
 FOITER=${FOITER:-60}
 FOETA=${FOETA:-0.1}
 THETAETA=${THETAETA:-0.05}
-RESTART=${RESTART:-40}
+RESTART=${RESTART:-20}
 LOGCH=${LOGCH:-Message,Error,Warning}
 TAG=$(basename "${CONFIG}")
 # Per-submission UNIQUE log (never overwrite -- feedback-unique-logs). JOB_ID set by SGE.

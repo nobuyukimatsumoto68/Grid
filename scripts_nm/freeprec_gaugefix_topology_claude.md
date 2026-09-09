@@ -529,3 +529,215 @@ measured, and cheap to fix -- unlike the lump, which we exhausted.
    (both cheap); a3 norm-optimised GD as the principled follow-up (roadmap Dir 1c machinery).
 4. Channel 1 regardless: **deflation of the m0d stragglers** on the FGMRES side (we already have
    the 640 modes), and note $M_1$ is expected to gain from any frame-localisation improvement.
+
+## 8. The restart-20 non-convergence: restarted-GMRES stall on the near-null cluster (Nobu 2026-09-08)
+
+**Symptom.** In the 42-config scan (frame $s/t_0=6$, functional $\sim 0.009$ = clean/converged, baseline
+RB-CGNE, **FGMRES restart $=20$**), FGMRES($M_0$) hit the 20000-iter cap on 73% of runs (90/124), and
+$0/248$ config$\times$mass points beat RB-CGNE. This is NOT present in the original headline setup, which
+used **no-restart** FGMRES ($256$) and won $2.3$--$6.7\times$.
+
+**It is not the frame and not a bug.** Same log, same frame, same tolerance: RB-CGNE converges ($\sim
+250$/$1060$/$1440$ iters at $m=0.1$/$0.01$/$0.001$), and **FGMRES($M_1$) at the SAME restart $=20$
+converges** (e.g. 640 $m=0.1$: $M_0$ capped vs $M_1$ 3287 iters; 600 $m=0.1$: $M_0$ capped vs $M_1$
+5499). A global solver misconfiguration would break $M_1$ too. So the stall is specific to $M_0$ under a
+short restart window.
+
+**Mechanism.** $M_0 D_\text{DW}$ sends the bulk spectrum to $\approx 1$ but leaves $\sim 12$ isolated
+near-null eigenvalues at $\mathrm{Re}\approx 0.3$ (measured directly, config 640, m0devals dump: 12
+conjugate pairs $|\lambda|\sim 0.31$--$0.36$, all in the right half-plane). GMRES minimises the residual
+over a Krylov space of dim = restart length; to place a polynomial root near each isolated small
+eigenvalue it needs at least as many independent Krylov directions as there are outliers, and full-GMRES
+succeeds because its GROWING subspace acts as an implicit deflation of exactly those modes. **Restarting
+at $k$ discards the accumulated subspace every $k$ steps**, so the isolated cluster is never resolved and
+the residual plateaus -- the classic restarted-GMRES stagnation on a matrix with a few small,
+well-separated eigenvalues. Peter Boyle's window scan (recorded in the test source) shows the same
+signature on an easier regime: no-restart 233 iters $\to$ window-128 829 $\to$ window-32 3353 $\to$
+window-16 unconverged. Config 640 is harder (the topological $|Q|=3$ near-null cluster), so restart-20
+stalls outright.
+
+Why $M_1$ escapes: the $D_\text{DW}[U^L]$ correction lifts the near-null stragglers into the bulk, so
+$M_1 D_\text{DW}$ has no isolated small cluster and a $k=20$ window suffices.
+
+**Prediction (the restart-$N$ scan, config 640, tests this).** Iterations should fall steeply and
+monotonically with the restart length, with the "knee" appearing once the window exceeds the effective
+outlier count. The knee location = the size of the deflation space that would substitute for a large
+window.
+
+**RESULT (restart-$N$ scan, config 640, $m=0.1$, 2026-09-08; job 7494645, one converged frame):**
+
+| restart | iters | $D_W$ applies | wall (s) |
+|--------:|------:|--------------:|---------:|
+| 20  | 18477 | 147816 | 592  |
+| 40  | 5691  | 45528  | 238  |
+| 80  | 473   | 3784   | 28.9 |
+| 128 | 242   | 1936   | 19.8 |
+| 256 | 175   | 1400   | 26.1 |
+
+Sharp knee between 40 and 80 ($5691\to473$, $12\times$); by window-80 it is essentially at the
+no-restart floor (175 @ 256). Confirms \S8: pure restarted-GMRES stagnation on an isolated cluster. TWO
+calibrations for the deflation design: (i) the knee is at window $\approx 80$, NOT $\approx 12$--$20$, so
+the effective hard subspace exceeds the 12 counted stragglers (the spectrum run truncated the $\pm$
+cluster at Nstop=12) -> expect GMRES-DR to need $k \approx 40$--$80$; widen the $k$-sweep to
+$\{8,16,24,40,64,96\}$. (ii) wall is non-monotone (256 @ 26 s $>$ 128 @ 20 s) from $O(\text{iters}^2)$
+orthogonalisation + larger Krylov -> a genuine sweet spot exists; deflation targets the
+low-count/low-memory corner. ($m=0.01/0.001$ sweep points appended when the job finishes.)
+
+**Fix options (memory is the real constraint at $24^4$, where no-restart OOMs).**
+1. **No-restart / large window** -- recovers the original win but does not scale in memory to $24^4$.
+2. **Deflated / recycling GMRES (GCRO-DR, Parks et al. 2006; or eigenvalue-deflated FGMRES)** -- augment
+   the small-$k$ Krylov space with the $\sim 12$--$20$ near-null Ritz vectors (harvested cheaply from the
+   FGMRES Arnoldi Hessenberg, or from a one-off IRL on $M_0 D_\text{DW}$). This is the principled fix:
+   $O(20)$ deflation vectors + restart-20 window $\approx$ no-restart behaviour at a fraction of the
+   memory. Strongest evidence yet FOR deflation (the cluster is $\sim 12$ modes, not the 3 tried earlier).
+3. **$M_1$** -- already converges at restart-20; the built-in operator-level fix, at the cost of one
+   $D_\text{DW}[U^L]$ apply per iteration (so honest currency $2 L_s\cdot$iters).
+4. **Double-preconditioner** (reduced-$L_s$/zMobius $\times$ free frame) -- roadmap Dir 3.
+
+Cite: restarted-GMRES stagnation on isolated eigenvalues -- Saad & Schultz 1986 (GMRES), Embree 2003
+(the tortoise-and-hare restart analysis); deflated restarting -- Morgan 2002 (GMRES-DR), Parks, de
+Sturler et al. 2006 (GCRO-DR).
+
+### 8.1. Deflated / recycling GMRES: how it works and why it fits (Nobu 2026-09-08)
+
+**Baseline: restarted GMRES$(m)$.** One cycle builds the Krylov space $\mathcal{K}_m(A,r_0) =
+\mathrm{span}\{r_0, Ar_0, \dots, A^{m-1}r_0\}$ via Arnoldi,
+$$
+A V_m = V_{m+1}\bar H_m = V_m H_m + h_{m+1,m}\, v_{m+1} e_m^\top,
+$$
+and minimises $\lVert r_0 - AV_m y\rVert = \lVert \beta e_1 - \bar H_m y\rVert$, giving $x = x_0 + V_m
+y$. Then it DISCARDS $V_m$ and restarts from the new residual. Discarding $V_m$ throws away all spectral
+information built up about the small eigenvalues -- that is the stall (\S8).
+
+**Idea common to both fixes: keep a few vectors across the restart.** Instead of restarting from scratch,
+carry a small set of $k$ vectors that approximate the invariant subspace of the $k$ near-null
+eigenvalues, and make every subsequent cycle work in the space AUGMENTED by them. The iteration then
+behaves as if those eigenvalues had been removed from $A$'s spectrum -- the effective condition number is
+that of the deflated operator, so a small window $m$ recovers near-no-restart convergence.
+
+**Where the $k$ vectors come from -- harmonic Ritz, essentially free.** From the same Arnoldi Hessenberg
+$\bar H_m$ already built each cycle, the harmonic Ritz pairs $(\theta_i, y_i = V_m g_i)$ solve the small
+$m\times m$ eigenproblem
+$$
+\big(H_m + h_{m+1,m}^2\, f\, e_m^\top\big)\, g_i = \theta_i\, g_i,
+\qquad f = H_m^{-H} e_m .
+$$
+The $k$ smallest-$|\theta_i|$ harmonic Ritz vectors approximate the near-null modes we measured (the 12
+$M_0 D_\text{DW}$ stragglers at $\mathrm{Re}\approx 0.3$). No separate eigensolve is needed -- though a
+one-off IRL/IRA on $M_0 D_\text{DW}$ (we have the header + the 640 modes) can seed them.
+
+**GMRES-DR$(m,k)$ (Morgan 2002) -- deflation WITHIN one solve.** Next cycle's subspace is
+$$
+\mathrm{span}\{\, y_1,\dots,y_k,\; r_0,\, Ar_0,\dots, A^{\,m-k-1}r_0 \,\},
+$$
+i.e. the $k$ retained harmonic Ritz vectors PLUS a length-$(m-k)$ Krylov continuation. Morgan's key
+result: this augmented space is still spanned by an $(m{+}1)\times m$ Arnoldi-like relation $A[Y_k\,V] =
+[Y_k\,V]_{+}\bar H$ with a structured (not upper-Hessenberg) $\bar H$, so the per-cycle cost and the
+least-squares solve are the SAME size as GMRES$(m)$ -- only $k$ extra vectors are stored. Effect:
+restart-$20$ + $k{=}20$ deflation $\approx$ no-restart, at the memory of $\sim 40$ vectors instead of
+$256$.
+
+**GCRO-DR (Parks, de Sturler et al. 2006) -- recycling ACROSS solves.** Generalises GMRES-DR so the
+deflation subspace PERSISTS across different right-hand sides and across a slowly-changing sequence of
+matrices $A^{(1)}, A^{(2)}, \dots$. Maintain a recycle space $U_k$ with $C_k = A U_k$ orthonormal
+($C_k^H C_k = I$). Each solve:
+$$
+x = x_0 + U_k\, C_k^H r_0 \;+\; \text{(GMRES correction in } \mathcal{K}_m\big((I - C_kC_k^H)A,\,(I -
+C_kC_k^H)r_0\big)),
+$$
+i.e. an exact projection onto $\mathrm{range}(U_k)$ plus a windowed GMRES on the deflated operator $(I -
+C_kC_k^H)A$. After each solve $U_k$ is refreshed from the harmonic Ritz vectors of the combined
+$[U_k, V_m]$ space and handed to the next system.
+
+**Why this is the RIGHT tool for the free-prec project (three nested recycling opportunities):**
+1. **Within a solve:** deflates the $\sim 12$ $M_0 D_\text{DW}$ near-null modes -> restart-$20$ behaves
+   like no-restart. Fixes \S8 directly.
+2. **Across the mass loop (same config + frame):** the near-null subspace is dominated by the
+   topological would-be-zero modes, which are nearly mass-INDEPENDENT. So recycle $U_k$ from $m=0.1$ into
+   $m=0.01$ and $0.001$ -- the expensive small-mass solves (RB-CGNE $1060$/$1436$ iters) start
+   pre-deflated. This is where the biggest wall-clock is.
+3. **Across HMC (the production payoff):** within a trajectory $D_\text{DW}[U]$ changes slowly along the
+   MD path, and every force evaluation is a fresh solve -- exactly the "sequence of slowly-varying
+   systems" GCRO-DR was designed for. Recycling amortises the deflation-space construction over the whole
+   trajectory.
+
+**Memory (the reason it beats no-restart at $24^4$).** GMRES-DR$(m,k)$ stores $\sim m+k$ fermion fields.
+At $24^4$ $L_s{=}8$ one field is $\sim(24/16)^4 \times 100\,\text{MB} \approx 0.5\,\text{GB}$, so
+restart-$20$ + $k{=}20$ $\approx 40$ vectors $\approx 20\,\text{GB}$ (fits a $\ge 40$ GB card), whereas
+no-restart $256$ $\approx 128\,\text{GB}$ does not. That is the whole point: deflation buys the
+no-restart convergence at a small-window memory budget.
+
+**Grid status / implementation note.** Grid ships `FlexibleGeneralisedMinimalResidual` (what we use) but
+NOT GMRES-DR/GCRO-DR. Implementation path: augment the existing FGMRES with (i) harmonic-Ritz extraction
+from $\bar H_m$ (small dense Eigen solve -- the machinery already in
+`ImplicitlyRestartedArnoldi_claude.h`), (ii) subspace carry-over across restarts (GMRES-DR) then across
+solves (GCRO-DR recycle space). Keep the $M_0$ right-preconditioning unchanged; deflation wraps the outer
+Krylov. Cite in code: Morgan, SIAM J. Matrix Anal. Appl. 24 (2002) 20 (GMRES-DR); Parks, de Sturler,
+Mackey, Johnson, Maiti, SIAM J. Sci. Comput. 28 (2006) 1651 (GCRO-DR).
+
+### 8.2. GMRES-DR IMPLEMENTED + first result (config 640, 2026-09-08)
+
+Solver `Grid/Grid/algorithms/iterative/RecyclingGeneralisedMinimalResidual_claude.h` (GCRO-DR core,
+`RecycleAcrossSolves` flag -> GMRES-DR / GCRO-DR) + `HarmonicRitz_claude.h` (unit-tested). Wired into
+`Test_dwf_freeprec_claude.cc` (`--ops gmresdr,gcrodr`, `--deflate-k`, `--deflate-sweep`). First $k$-sweep,
+640, restart $m=20$, vs RB-CGNE (job 7495819):
+
+| $m=0.1$ (RB 252 it) | iters | $D_W$ | vs RB | | $m=0.01$ (RB 1150 it) | iters | vs RB |
+|--------------------:|------:|------:|------:|-|----------------------:|------:|------:|
+| plain restart-20    | 18477 | 147816| 0.03x | | plain restart-20      | 20000c| --    |
+| GMRES-DR k=8        | 1040  | 8320  | 0.48x | | k=8                   | 3420  | 0.67x |
+| GMRES-DR k=16       | 540   | 4320  | 0.93x | | k=16                  | 600   | 3.83x |
+| GMRES-DR k=20       | 280   | 2240  | 1.8x  | | k=20                  | 660   | 3.48x |
+| (no-restart-256)    | 175   | 1400  | 2.88x | |                       |       |       |
+
+**GMRES-DR fixes the stall and restores a $D_W$-count win**: restart-20 goes $18477\to280$ iters at
+$m=0.1$ ($66\times$), stalled$\to600$ at $m=0.01$, giving $1.8\times$ / $3.8\times$ over RB-CGNE at the
+memory of $\sim(m+k)=40$ vectors (vs no-restart 256). WALL stays $<1$ ($M_0$ FFT cost dominates per-iter)
+-- $D_W$ count is the project currency, reported honestly.
+
+THREE bugs found + FIXED (2026-09-08):
+1. **$k>m$ was clamped to $m$** -> k=24..96 silently ran as k=20. The $k$ recycle vectors live OUTSIDE the
+   $m$-Arnoldi, so $k$ may exceed $m$ (grows across cycles, cap $nv=kc+m$). Clamp REMOVED.
+2. **Recurrence-residual drift** (reported "converged" at true $3.5\mathrm{e}{-7}$): a symptom, not the
+   cause. Fixed by TRUE-residual recompute $r=\text{src}-A\,\psi$ each cycle -- which then EXPOSED bug 3.
+3. **THE REAL BUG -- fp32 preconditioner floor / non-flexibility.** With the honest residual, GMRES-DR
+   FLOORED at true $\approx 3.2\mathrm{e}{-7}$ (both the old false-converge and the re-run land at the same
+   $\sim 3\mathrm{e}{-7}$ = fp32 $M_0$ noise, fp32 eps $\sim 1\mathrm{e}{-7}$) and ran to the cap. Cause: I
+   used the NON-flexible right-preconditioned form (build Krylov of $B=A M_0$, reconstruct $x = M_0 u$ with
+   ONE final $M_0$ apply) -- that floors at the $M_0$ fp32 precision. Grid's FGMRES reaches $1\mathrm{e}{-8}$
+   with the SAME fp32 $M_0$ because it is FLEXIBLE: it stores the actual images $z_j = M_0 v_j$ and builds
+   the solution from THEM, never re-applying $M_0$. FIX: rewrote the solver as FLEXIBLE deflated/recycling
+   GMRES -- store $Z=M_0 V$, accumulate $x \mathrel{+}= Y d_w + Z d_v$, recycle vectors in SOLUTION space $Y$
+   with $W = A Y$ orthonormal (was $U$ with $C=B U$). The deflation math is the same combined harmonic-Ritz
+   GEP with $\hat V=[Y,Z]$, $\hat W=[W,V]$ (the $V^H Z$ overlap block is now full, no identity shortcut).
+   CPU compile clean; GPU re-run PENDING. NOTE the FIRST re-run (job 7498957) uses the pre-flexible binary
+   -> it floors and churns to the cap; qdel it.
+Re-run k-sweep {8,16,24,40,64,96} should now reach the no-restart floor (175 iters @ m=0.1) at true
+$1\mathrm{e}{-8}$, at the knee $k\approx 40$--$80$. Impl plan: `scripts_nm/gmres_deflation_impl_plan_claude.md`.
+
+4. **Flexible rewrite reached 1e-8 but BROKE deflation** (job 7499769: k=8 true $9.75\mathrm{e}{-9}$ OK but
+   16600 iters, k=16 diverged to $1.5\mathrm{e}{-4}$). Cause: I moved the harmonic Ritz into SOLUTION space
+   $[Y,Z]$ -- a different, wrong eigenproblem. FIX: keep the VALIDATED u-space harmonic Ritz of $B=A M_0$
+   over $[U,V]$ (C=BU, $V^H V=I$ shortcut) UNCHANGED, and additionally carry $Y=M_0 U$ (assembled from the
+   SAME stored images $[Y,Z]P$, no extra applies) purely for the flexible reconstruction $x{+}{=}Y d_u{+}Z d_v$.
+   Store the triple $U$ (u-space, for the Ritz), $Y{=}M_0 U$ (solution, for $x$), $C{=}BU{=}AY$ (for the
+   projection); invariants $Y{=}M_0U$, $C{=}BU$ preserved across cycles. Memory 3k+2m vectors at 16^4 = fine.
+
+**GMRES-DR VALIDATED (job 7500570, config 640, restart m=20, vs RB-CGNE, ALL true residual 1e-8):**
+
+| $m=0.1$ (RB 252 it) | iters | $D_W$ | vs RB | | $m=0.01$ (RB 1150 it) | iters | vs RB |
+|--------------------:|------:|------:|------:|-|----------------------:|------:|------:|
+| k=8  | 1040 | 8320 | 0.48x | | k=8  | 3680 | 0.63x |
+| k=16 | 540  | 4320 | 0.93x | | k=16 | 600  | 3.83x |
+| k=24 | 220  | 1760 | 2.29x | | ...  |      |       |
+| k=40 | 200  | 1600 | 2.52x | |      |      |       |
+| k=64 | 180  | 1440 | 2.8x  | |      |      |       |
+| k=96 | 180  | 1440 | 2.8x  | |      |      |       |
+| (no-restart-256) | 175 | 1400 | 2.88x | | | | |
+
+Deflation FULLY restores no-restart convergence at restart-20: k=64 -> 180 iters ~ the 175 floor, a
+$100\times$ drop from plain restart-20's 18477. Net $D_W$-count win over RB-CGNE 2.3--2.8x (m=0.1),
+3.8x+ (m=0.01), at true 1e-8. Sharp knee k=16->24. WALL still $<1$ ($M_0$ FFT cost) AND grows with k
+(k=64 250s, k=96 425s) because the 3-set `updateRecycleSpace` overlaps scale $O((k{+}m)^2)$/cycle ->
+count/cost sweet spot $k\approx 24$--$40$. NEXT: chunk 3 (GCRO-DR recycle across the mass loop) + chunk 5
+(mixed precision fp32 bulk + fp64 reliable update = the real WALL win; baseline -> ConjugateGradientMixedPrec).

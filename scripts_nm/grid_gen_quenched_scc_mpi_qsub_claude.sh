@@ -2,9 +2,12 @@
 # BU SCC SGE *BATCH* job: quenched Iwasaki SU(3) generation under MPI on CPU nodes (R2 chunk C).
 # Follows the SCC MPI job-script convention (rcs.bu.edu MPI example + nmatsumo/scripts/run.sh):
 #   #$ -pe mpi_16_tasks_per_node <total_cores>   (16-core MPI node set, 128 GB, FDR Infiniband)
-# We use the 16-core nodes with 1 MPI RANK per node and OpenMP=16 (hybrid): 2 nodes -> 32 cores,
-# NSLOTS=32, 2 ranks, 16 threads/rank (2-node default -- schedules faster than 4; ~2x slower/traj).
-# MinimumNorm2 integrator, trajL=1.6. For 4 nodes: qsub -pe mpi_16_tasks_per_node 64 -v MPIDECOMP=2.2.1.1 ...
+# We use the 16-core nodes with 1 MPI RANK per node and OpenMP=16 (hybrid). DEFAULT = SINGLE node:
+# NSLOTS=16, 1 rank, 16 threads, MPIDECOMP=1.1.1.1 -- no inter-node reservation, so it schedules like an
+# ordinary omp-16 job (multi-node reservations of 2/4 nodes were NOT scheduling on qfe). 24^4 pure-gauge
+# fits in one 128 GB node. MinimumNorm2 integrator, trajL=1.6.
+# For more speed once the queue allows it: 2 nodes  qsub -pe mpi_16_tasks_per_node 32 -v MPIDECOMP=2.1.1.1 ...
+#                                          4 nodes  qsub -pe mpi_16_tasks_per_node 64 -v MPIDECOMP=2.2.1.1 ...
 # Saves ckpoint_lat.<t> AND ckpoint_rng.<t> every SAVE traj -> RESUMABLE via START=CheckpointStart.
 # #configs = TRAJ/SAVE ; 40 configs = TRAJ 800, SAVE 20.
 #
@@ -24,7 +27,7 @@
 #$ -j y
 ##$ -m n
 #$ -l h_rt=6:00:00
-#$ -pe mpi_16_tasks_per_node 32
+#$ -pe mpi_16_tasks_per_node 16
 
 set -u
 
@@ -32,12 +35,13 @@ module load gcc/12.2.0
 module load openmpi/4.1.5_gnu-12.2.0
 
 ROOT=/projectnb/qfe/nmatsum/dwf
-BIN=${ROOT}/build_mpi/Test_hmc_IwasakiGauge_claude     # MinimumNorm2 variant (cmdline trajL/mdsteps/save)
+BIN=${BIN:-${ROOT}/build_mpi_merged/Test_hmc_IwasakiGauge_claude}   # merged-source binary (has Q0 monitor);
+                                           # pre-merge build_mpi has NO HMC binary -> must use build_mpi_merged.
 
 # ---- runtime knobs (qsub -v) ----
 GRID=${GRID:-24.24.24.24}
 THREADS=${THREADS:-16}               # OpenMP threads per rank = cores per 16-core node
-MPIDECOMP=${MPIDECOMP:-2.1.1.1}      # product MUST equal #ranks (= NSLOTS/THREADS = 2 for the 2-node default)
+MPIDECOMP=${MPIDECOMP:-1.1.1.1}      # product MUST equal #ranks (= NSLOTS/THREADS = 1 for the single-node default)
 TRAJ=${TRAJ:-800}                    # production trajectories; #configs = TRAJ/SAVE
 THERM=${THERM:-10}                   # = Grid NoMetropolisUntil: always-accept burn-in traj (ignored on CheckpointStart)
 SAVE=${SAVE:-20}                     # save every SAVE -> 800/20 = 40 configs
@@ -49,7 +53,7 @@ OUTDIR=${OUTDIR:-${ROOT}/configs_iwasaki_24_b2.6}
 
 export OMP_NUM_THREADS=${THREADS}
 export OPENBLAS_NUM_THREADS=${THREADS}
-NP=$(( ${NSLOTS:-32} / THREADS ))    # 32/16 = 2 ranks (1 per node)
+NP=$(( ${NSLOTS:-16} / THREADS ))    # 16/16 = 1 rank (single node default)
 
 echo "=========================================================="
 echo "Start date : $(date)   Job ID : ${JOB_ID:-?}   Host : ${HOSTNAME:-?}"

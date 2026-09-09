@@ -26,10 +26,18 @@ module load gcc/13.2.0
 ROOT=/projectnb/qfe/nmatsum/dwf
 LOGDIR=${ROOT}/log
 mkdir -p "${LOGDIR}"
-BIN=${ROOT}/build/Test_dwf_freeprec_claude
+BIN=${ROOT}/build_merged/Test_dwf_freeprec_claude   # merged GPU tree (post-merge; build/ is pre-merge)
 GRID=${GRID:-16.16.16.16}
 CONFIG=${CONFIG:?set CONFIG=<NERSC config>}
-# Per-submission UNIQUE log (never overwrite a prior run's log -- Nobu 2026-09-07). JOB_ID is set by SGE.
+MASSLIST=${MASSLIST:-0.1:0.01:0.001}   # DWF masses LOOPED over the SINGLE frame; COLON-sep (SGE -v splits commas)
+MLCOMMA=$(echo "${MASSLIST}" | tr ':' ',')   # --mass-list wants commas
+OPS=${OPS:-}               # additive op list cgne,m0,m1,gmresdr,gcrodr (empty = all default; rb-cgne on by default)
+OPSOPT=""; [ -n "${OPS}" ] && OPSOPT="--ops ${OPS}"
+RESTART=${RESTART:-}       # FGMRES/GMRES-DR restart window m (empty = binary default 20)
+DEFLATEK=${DEFLATEK:-}     # GMRES-DR/GCRO-DR saved low modes k (empty = binary default 24)
+RSOPT=""; [ -n "${RESTART}" ]  && RSOPT="--restart ${RESTART}"
+DKOPT=""; [ -n "${DEFLATEK}" ] && DKOPT="--deflate-k ${DEFLATEK}"
+# Frame s/t0=6, gf_maxit 4000, restart 20 are now BINARY DEFAULTS (Nobu 2026-09-07). Per-submission UNIQUE log.
 OUTLOG=${OUTLOG:-${LOGDIR}/freeprec_gpu_$(basename "${CONFIG}")_j${JOB_ID:-manual}_claude.log}
 
 export OMP_NUM_THREADS=${NSLOTS:-4}
@@ -41,6 +49,8 @@ if [ ! -x "${BIN}" ]; then echo "ERROR: GPU freeprec binary missing ${BIN}"; exi
 if [ ! -f "${CONFIG}" ]; then echo "ERROR: config missing ${CONFIG}"; exit 1; fi
 
 # comms=none CUDA binary: run directly (no mpirun), one GPU.
-"${BIN}" --grid "${GRID}" --mpi 1.1.1.1 --config "${CONFIG}" --accelerator-threads 8 2>&1 | tee "${OUTLOG}"
+echo "MASSLIST=${MASSLIST}  OPS=${OPS:-all}  RESTART=${RESTART:-default}  DEFLATEK=${DEFLATEK:-default}  (single frame s/t0=6 reused; gf_maxit 4000)"
+"${BIN}" --grid "${GRID}" --mpi 1.1.1.1 --config "${CONFIG}" --mass-list "${MLCOMMA}" ${OPSOPT} ${RSOPT} ${DKOPT} \
+         --accelerator-threads 8 2>&1 | tee "${OUTLOG}"
 echo "freeprec exit = ${PIPESTATUS[0]}   $(date)"
 echo "log -> ${OUTLOG}"

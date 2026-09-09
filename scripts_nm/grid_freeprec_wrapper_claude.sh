@@ -14,9 +14,12 @@
 set -u
 
 SNM=/projectnb/qfe/nmatsum/dwf/Grid/scripts_nm
-JOBSCRIPT=${JOBSCRIPT:-${SNM}/grid_freeprec_run_1node_qsub_claude.sh}
+JOBSCRIPT=${JOBSCRIPT:-${SNM}/grid_freeprec_run_gpu_qsub_claude.sh}   # GPU 1-config-per-job (default)
 GRID=${GRID:-16.16.16.16}
-OPS=${OPS:-}                          # additive op list cgne,m0,m1 forwarded to the run script (empty=all)
+OPS=${OPS:-}                          # additive op list cgne,m0,m1,gmresdr,gcrodr forwarded to the run script (empty=all)
+MASSLIST=${MASSLIST:-0.1:0.01:0.001}  # DWF masses (COLON-sep; SGE -v splits on commas) looped/frame, one job/config
+RESTART=${RESTART:-}                  # GMRES-DR restart window m (empty=binary default 20) -- Phase B fixed (m,k)
+DEFLATEK=${DEFLATEK:-}                # GMRES-DR saved low modes k (empty=binary default 24) -- Phase B fixed (m,k)
 DRYRUN=${DRYRUN:-0}
 
 # config selection: CONFIGS (explicit) wins; else CONFIGDIR + MINTRAJ/SKIP (numeric-sort by trajectory,
@@ -45,7 +48,7 @@ echo "wrapper: $(basename "${JOBSCRIPT}")  GRID=${GRID}  DRYRUN=${DRYRUN}  -> ${
 for C in ${cfglist}; do
   [ -f "${C}" ] || { echo "  skip missing ${C}"; continue; }
   base=$(basename "${C}")
-  opts=(-terse -v "CONFIG=${C},GRID=${GRID}${OPS:+,OPS=${OPS}}")
+  opts=(-terse -v "CONFIG=${C},GRID=${GRID},MASSLIST=${MASSLIST}${OPS:+,OPS=${OPS}}${RESTART:+,RESTART=${RESTART}}${DEFLATEK:+,DEFLATEK=${DEFLATEK}}")
   if [ "${DRYRUN}" = "1" ]; then
     echo "  [dryrun] qsub ${opts[*]} $(basename "${JOBSCRIPT}")   # ${base}"
   else
