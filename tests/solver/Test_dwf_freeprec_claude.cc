@@ -85,6 +85,46 @@ static int g_deflate_k = 24;  // deflation dim k for GMRES-DR/GCRO-DR (--deflate
                               // Restart-N scan on 640 puts the plain-GMRES knee at window ~80 -> expect
                               // k ~ 40-80 to bring restart-20 near the no-restart floor. --deflate-sweep scans.
 static std::vector<int> g_deflate_sweep;   // --deflate-sweep a,b,c : GMRES-DR at each k back-to-back
+static bool g_prerot = false;  // --prerot: Peter Boyle pre-rotation. Gauge-transform U -> U^Omega = Omega U
+                               // Omega^dag ONCE and precondition with the BARE free inverse F (identity
+                               // frame), rotating the source by Omega5, instead of applying Omega each M0
+                               // apply. Unitarily equivalent (same iters) -- removes the per-apply Omega.
+
+// ---- flowed-config cache -----------------------------------------------------------------------------
+// The gradient flow (config-only, mass-independent) is the expensive per-config step and is IDENTICAL
+// across every run at the same (config, flow type, eps, nstep). Cache the flowed config as a NERSC file
+// keyed by a UNIQUE flow label so later runs of the SAME setup load it and skip the flow. NERSC I/O is
+// LIME-free and importable by any Grid tool. --flowcache <dir> enables it (dir must exist); empty = off.
+static std::string g_flowcache_dir = "";   // --flowcache <dir>; empty -> caching disabled
+static std::string g_cfg_basename = "";     // set from --config basename; keys the flow label
+
+// unique flow label: config basename + flow type (wilson) + eps + nstep. Same setup -> same label/file.
+static std::string flow_label(const std::string& cfg_base, double eps, int nstep) {
+  std::ostringstream os;
+  os << "flow_" << cfg_base << "_wilson_eps" << eps << "_n" << nstep;
+  return os.str();
+}
+static std::string flow_cache_file(const std::string& dir, const std::string& cfg_base, double eps, int nstep) {
+  return dir + "/" + flow_label(cfg_base, eps, nstep) + ".nersc";
+}
+// file checker
+static bool flow_cache_exists(const std::string& path) {
+  std::ifstream f(path.c_str());
+  return f.good();
+}
+// loader: read the cached flowed config if present; returns true on hit
+static bool flow_cache_load(LatticeGaugeFieldD& Uflowed, const std::string& path) {
+  if (!flow_cache_exists(path)) {
+    return false;
+  }
+  FieldMetaData h;
+  NerscIO::readConfiguration(Uflowed, h, path);
+  return true;
+}
+// checkpointer: write the flowed config (NERSC, LIME-free)
+static void flow_cache_save(LatticeGaugeFieldD& Uflowed, const std::string& path) {
+  NerscIO::writeConfiguration(Uflowed, path, "DWF", "FLOWCACHE", 1);
+}
 
 static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
                          GridCartesian* UGrid, GridRedBlackCartesian* UrbGrid,
@@ -97,8 +137,25 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
 
   Real plaq0 = WilsonLoops<PeriodicGimplD>::avgPlaquette(U);
   LatticeGaugeFieldD Uflowed(UGrid);
-  WilsonFlow<PeriodicGimplD> wf(flow_eps, flow_nstep);
-  wf.smear(Uflowed, U);
+  // flow cache: load the flowed config if a matching (config, eps, nstep) checkpoint exists; else flow + save.
+  std::string flowpath;
+  bool flow_loaded = false;
+  if (!g_flowcache_dir.empty()) {
+    std::string cfg_base = g_cfg_basename.empty() ? std::string("hot") : g_cfg_basename;
+    flowpath = flow_cache_file(g_flowcache_dir, cfg_base, flow_eps, flow_nstep);
+    flow_loaded = flow_cache_load(Uflowed, flowpath);
+    if (flow_loaded) {
+      std::cout << "  [flowcache] LOADED " << flowpath << " (gradient flow skipped)" << std::endl;
+    }
+  }
+  if (!flow_loaded) {
+    WilsonFlow<PeriodicGimplD> wf(flow_eps, flow_nstep);
+    wf.smear(Uflowed, U);
+    if (!g_flowcache_dir.empty()) {
+      flow_cache_save(Uflowed, flowpath);
+      std::cout << "  [flowcache] SAVED " << flowpath << std::endl;
+    }
+  }
   Real plaq_flowed = WilsonLoops<PeriodicGimplD>::avgPlaquette(Uflowed);
   LatticeColourMatrixD xform(UGrid);
   // Landau fix. Grid's FourierAccelSteepestDescentStep weights the force by psqMax/psq with psqMax=16
@@ -125,6 +182,23 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
             << "  flowed-fixed Landau functional=" << landau << "  Q(orig)=" << Q
             << "  Q_5Li(frame-flowed tau=" << (flow_eps * flow_nstep) << ")=" << Qflow << std::endl;
 
+  // Omega pre-rotation (Peter Boyle): gauge-transform the config U -> U^Omega = Omega U Omega^dag ONCE
+  // (mass-independent, like the frame), so the preconditioner becomes the BARE free inverse F (identity
+  // frame) with no per-apply Omega; rotate the source by Omega5. D5[U^Omega] = Omega D5[U] Omega^dag is
+  // unitarily equivalent, so iteration counts are unchanged -- this is a per-apply cost/cleanliness win.
+  LatticeGaugeFieldD Urot(UGrid);
+  LatticeColourMatrixD Om5(FGrid);
+  LatticeColourMatrixD idxf(UGrid);
+  if (g_prerot) {
+    Urot = U;
+    SU<Nc>::GaugeTransform<PeriodicGimplD>(Urot, xform);
+    for (int s = 0; s < Ls; ++s) {
+      InsertSlice(xform, Om5, s, 0);
+    }
+    idxf = ComplexD(1.0, 0.0);   // identity frame -> M0 = I^dag F I = bare F
+    std::cout << "  [prerot] built U^Omega + Omega5 broadcast; preconditioner = bare F (identity frame)" << std::endl;
+  }
+
   // MASS LOOP: the frame (flow + Landau -> Uflowed, xform above) is mass-INDEPENDENT, built ONCE per
   // config and reused for every mass (Nobu 2026-09-07: don't separate the masses into distinct jobs).
   // Only D / free-kernel / M0 / solves below depend on the mass.
@@ -132,7 +206,7 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
   double mm = masses[im];
   std::cout << "  ======== mass m = " << mm << "  (frame reused) ========" << std::endl;
   WilsonImplD::ImplParams Params(boundary);
-  MobiusFermionD D(U, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
+  MobiusFermionD D(g_prerot ? Urot : U, *FGrid, *FrbGrid, *UGrid, *UrbGrid, mm, M5, bb, cc, Params);
   // preconditioner (free-prec) mass: --mprec M builds M0 at DW mass M != operator mm (Tikhonov scan);
   // default (g_mprec sentinel) = matched (mm). DW has no additive renorm, so matched is "physical", but
   // the Wilson scan showed a heavier m_prec can help (Tikhonov) -- scan to check DW.
@@ -143,10 +217,13 @@ static void run_headline(const std::string& tag, LatticeGaugeFieldD& U,
               << m5prec << " (op M5=" << M5 << ")]" << std::endl;
   }
   FreeMobius5DInverse<WilsonImplD> Ffree(FGrid, Ls, m5prec, bb, cc, mprec, boundary);
-  FreeLimitPreconditioner<WilsonImplD> M0(Ffree, xform, FGrid);
+  FreeLimitPreconditioner<WilsonImplD> M0(Ffree, g_prerot ? idxf : xform, FGrid);
 
   LatticeFermionD bsrc(FGrid);
   gaussian(RNG5, bsrc);
+  if (g_prerot) {
+    bsrc = Om5 * bsrc;   // rotate source into the frame: solve D5[U^Omega] (Omega x) = Omega b
+  }
   RealD solve_tol = 1.0e-8;
   int solve_maxit = 20000;  // generous headroom for small-m (m=0.01) baselines (kappa ~ 1/m)
   int fgmres_restart = g_fgmres_restart;  // track the global default/CLI (default 20); used by the M1 solve
@@ -744,6 +821,12 @@ int main(int argc, char** argv) {
   if (GridCmdOptionExists(argv, argv + argc, "--restart")) {
     g_fgmres_restart = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--restart"));
   }
+  if (GridCmdOptionExists(argv, argv + argc, "--prerot")) {
+    g_prerot = true;
+  }
+  if (GridCmdOptionExists(argv, argv + argc, "--flowcache")) {
+    g_flowcache_dir = GridCmdOptionPayload(argv, argv + argc, "--flowcache");   // dir must exist
+  }
   if (GridCmdOptionExists(argv, argv + argc, "--flow_nstep")) {
     g_flow_nstep = std::stoi(GridCmdOptionPayload(argv, argv + argc, "--flow_nstep"));
   }
@@ -817,6 +900,7 @@ int main(int argc, char** argv) {
   bool gate3b = true;
   if (have_cfg) {
     std::string cfgfile = GridCmdOptionPayload(argv, argv + argc, "--config");
+    g_cfg_basename = cfgfile.substr(cfgfile.find_last_of('/') + 1);   // flow-cache label key
     std::string evalfile = "/mnt/baracuda_14/dwms/dwf4_qcd_claude/cfg_su3_4444_b6.0_dw_evals_claude.dat";
     if (GridCmdOptionExists(argv, argv + argc, "--evals")) {
       evalfile = GridCmdOptionPayload(argv, argv + argc, "--evals");

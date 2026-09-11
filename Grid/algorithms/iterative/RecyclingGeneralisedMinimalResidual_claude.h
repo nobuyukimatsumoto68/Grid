@@ -65,6 +65,16 @@ class RecyclingGeneralisedMinimalResidual : public OperatorFunction<Field> {
   std::vector<Field> Cvec;   // C = B U = A Y, orthonormal (for the residual projection)
   bool haveRecycle;
 
+  // Optional EXTERNAL fixed deflation subspace (e.g. the 10 low modes of D5^H D5): seed the recycle
+  // space with these u-space vectors and (if FreezeRecycle) do NOT adaptively update them -- i.e. deflate
+  // exactly these modes. Set via SetDeflationSubspace. Empty -> pure adaptive GMRES-DR (default).
+  std::vector<Field> SeedU;
+  bool FreezeRecycle = false;
+  void SetDeflationSubspace(const std::vector<Field> &psi, bool freeze = true) {
+    SeedU = psi;
+    FreezeRecycle = freeze;
+  }
+
   RecyclingGeneralisedMinimalResidual(RealD   tol,
                                       Integer maxit,
                                       LinearFunction<Field> &Prec,
@@ -110,6 +120,50 @@ class RecyclingGeneralisedMinimalResidual : public OperatorFunction<Field> {
 
     Field w(grid);
     Field r(grid);
+
+    // Seed the recycle space with an EXTERNAL fixed deflation subspace (SeedU) if provided: build
+    // U = SeedU, Y = M0 U, C = B U = A Y, orthonormalise C (MGS), adjust U,Y so C^H C = I & C = B U.
+    if (!SeedU.empty() && !haveRecycle) {
+      int kk = (int)SeedU.size();
+      std::vector<Field> Uraw(kk, grid), Yraw(kk, grid), Craw(kk, grid);
+      for (int i = 0; i < kk; ++i) {
+        Uraw[i] = SeedU[i];
+        Preconditioner(Uraw[i], Yraw[i]);   // Y = M0 U
+        LinOp.Op(Yraw[i], Craw[i]);         // C_raw = A Y = B U
+      }
+      Eigen::MatrixXcd R = Eigen::MatrixXcd::Zero(kk, kk);
+      Cvec.assign(kk, Field(grid));
+      for (int j = 0; j < kk; ++j) {
+        Field q = Craw[j];
+        for (int i = 0; i < j; ++i) {
+          ComplexD rij = innerProduct(Cvec[i], q);
+          R(i, j) = rij;
+          q = q - rij * Cvec[i];
+        }
+        RealD nrm = sqrt(norm2(q));
+        R(j, j) = ComplexD(nrm, 0.0);
+        Cvec[j] = (1.0 / nrm) * q;
+      }
+      Eigen::MatrixXcd Rinv = R.inverse();
+      Uvec.assign(kk, Field(grid));
+      Yvec.assign(kk, Field(grid));
+      for (int j = 0; j < kk; ++j) {
+        Field au(grid), ay(grid);
+        au = Zero();
+        ay = Zero();
+        au.Checkerboard() = src.Checkerboard();   // C1: fresh Zero() defaults to Even; stamp the solve cb
+        ay.Checkerboard() = src.Checkerboard();
+        for (int i = 0; i < kk; ++i) {
+          au = au + ComplexD(Rinv(i, j)) * Uraw[i];
+          ay = ay + ComplexD(Rinv(i, j)) * Yraw[i];
+        }
+        Uvec[j] = au;
+        Yvec[j] = ay;
+      }
+      haveRecycle = true;
+      std::cout << GridLogMessage << "RecyclingGMRES: seeded fixed deflation subspace k=" << kk
+                << (FreezeRecycle ? " (frozen)" : " (adaptive)") << std::endl;
+    }
 
     // Flexible Arnoldi work space: V (orthonormal Krylov) and Z = M0 V (stored images).
     std::vector<Field> v(m + 1, grid);
@@ -217,16 +271,18 @@ class RecyclingGeneralisedMinimalResidual : public OperatorFunction<Field> {
       r = src - w;
       cp = norm2(r);
 
-      std::cout << GridLogIterative << "RecyclingGMRES: cycle " << cyc << " iters " << IterationCount
-                << " residual " << sqrt(cp) << " target " << sqrt(rsq) << std::endl;
+      std::cout << GridLogMessage << "RecyclingGMRES: cycle " << cyc << " iters " << IterationCount
+                << " residual " << sqrt(cp) << " target " << sqrt(rsq) << std::endl;   // per-cycle curve (discovery diag)
 
       if (cp <= rsq || IterationCount >= MaxIterations) {
         converged = (cp <= rsq);
         break;
       }
 
-      updateRecycleSpace(v, z, Hbar, Bmat, kc, jdone, k);
-      haveRecycle = (Cvec.size() > 0);
+      if (!FreezeRecycle) {   // frozen -> keep the seeded fixed deflation subspace (no harmonic-Ritz update)
+        updateRecycleSpace(v, z, Hbar, Bmat, kc, jdone, k);
+        haveRecycle = (Cvec.size() > 0);
+      }
     }
 
     SolverTimer.Stop();
@@ -263,6 +319,7 @@ class RecyclingGeneralisedMinimalResidual : public OperatorFunction<Field> {
                           int kc, int jdone, int k) {
 
     GridBase *grid = v[0].Grid();
+    int cb = v[0].Checkerboard();   // C1: stamp fresh Zero()-accumulators with the solve checkerboard (RB: Odd)
     const int nv = kc + jdone;
     const int nw = kc + jdone + 1;
 
@@ -334,8 +391,10 @@ class RecyclingGeneralisedMinimalResidual : public OperatorFunction<Field> {
     for (int j = 0; j < kk; ++j) {
       Field accu(grid);
       accu = Zero();
+      accu.Checkerboard() = cb;
       Field accy(grid);
       accy = Zero();
+      accy.Checkerboard() = cb;
       for (int i = 0; i < kc; ++i) {
         accu = accu + ComplexD(P(i, j)) * Uvec[i];
         accy = accy + ComplexD(P(i, j)) * Yvec[i];
@@ -349,6 +408,7 @@ class RecyclingGeneralisedMinimalResidual : public OperatorFunction<Field> {
 
       Field accc(grid);
       accc = Zero();
+      accc.Checkerboard() = cb;
       for (int i = 0; i < kc; ++i) {
         accc = accc + ComplexD(GP(i, j)) * Cvec[i];
       }
@@ -383,8 +443,10 @@ class RecyclingGeneralisedMinimalResidual : public OperatorFunction<Field> {
     for (int j = 0; j < kk; ++j) {
       Field accu(grid);
       accu = Zero();
+      accu.Checkerboard() = cb;
       Field accy(grid);
       accy = Zero();
+      accy.Checkerboard() = cb;
       for (int i = 0; i < kk; ++i) {
         accu = accu + ComplexD(Rinv(i, j)) * Uraw[i];
         accy = accy + ComplexD(Rinv(i, j)) * Yraw[i];

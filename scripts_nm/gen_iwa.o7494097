@@ -1,0 +1,144 @@
+==========================================================
+Start date : Tue Sep  8 12:11:26 EDT 2026   Job ID : 7494097   Host : scc-nd8
+NSLOTS=64  NP(ranks)=4  THREADS/rank=16  MPIDECOMP=2.2.1.1
+GRID=24.24.24.24  START=CheckpointStart  THERM=10  TRAJ=800  SAVE=20 (=> 40 configs)
+integrator=MinimumNorm2  trajL=1.6  MDSTEPS=24  dt=0.0666667
+OUTDIR=/projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6   BIN=/projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude
+==========================================================
++ mpirun -np 4 --map-by ppr:1:node --bind-to none /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude --grid 24.24.24.24 --mpi 2.2.1.1 --threads 16 --StartingType CheckpointStart --Thermalizations 10 --Trajectories 800 --save_interval 20 --trajL 1.6 --mdsteps 24 --StartTrajectory 560
+SharedMemoryMpi:  World communicator of size 4
+SharedMemoryMpi:  Node  communicator of size 1
+SharedMemoryMpi: SharedMemoryAllocate 1073741824 MMAP anonymous implementation 
+
+__|__|__|__|__|__|__|__|__|__|__|__|__|__|__
+__|__|__|__|__|__|__|__|__|__|__|__|__|__|__
+__|_ |  |  |  |  |  |  |  |  |  |  |  | _|__
+__|_                                    _|__
+__|_   GGGG    RRRR    III    DDDD      _|__
+__|_  G        R   R    I     D   D     _|__
+__|_  G        R   R    I     D    D    _|__
+__|_  G  GG    RRRR     I     D    D    _|__
+__|_  G   G    R  R     I     D   D     _|__
+__|_   GGGG    R   R   III    DDDD      _|__
+__|_                                    _|__
+__|__|__|__|__|__|__|__|__|__|__|__|__|__|__
+__|__|__|__|__|__|__|__|__|__|__|__|__|__|__
+  |  |  |  |  |  |  |  |  |  |  |  |  |  |  
+
+
+Copyright (C) 2015 Peter Boyle, Azusa Yamaguchi, Guido Cossu, Antonin Portelli and other authors
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+Current Grid git commit hash is undefined. Check makefile.
+
+Grid : Message : ================================================ 
+Grid : Message : MPI is initialised and logging filters activated 
+Grid : Message : ================================================ 
+Grid : Message : This rank is running on host scc-nd8 at local time 2026-09-08 12:11:27
+Grid : Message : Requested 1073741824 byte stencil comms buffers 
+Grid : Message : MemoryManager::Init() setting up
+Grid : Message : MemoryManager::Init() cache pool for recent host   allocations: SMALL 8 LARGE 2 HUGE 0
+Grid : Message : MemoryManager::Init() cache pool for recent device allocations: SMALL 16 LARGE 8 Huge 0
+Grid : Message : MemoryManager::Init() cache pool for recent shared allocations: SMALL 16 LARGE 8 Huge 0
+Grid : Message : MemoryManager::Init() Unified memory space
+Grid : Message : 0.001004 s : Grid is setup to use 16 threads
+Grid : Message : 0.004059 s : ::::::::::::::::::::::::::::::::::::::::
+Grid : Message : 0.004066 s : HMCResourceManager:
+Grid : Message : 0.004079 s : Created grid set with name 'gauge' and decomposition for the full cartesian 
+Grid : Message : 0.004081 s : 	Full Dimensions    : [24 24 24 24]
+Grid : Message : 0.004084 s : 	SIMD layout        : [1 1 1 2]
+Grid : Message : 0.004086 s : 	Global Dimensions  : [24 24 24 24]
+Grid : Message : 0.004088 s : 	Local Dimensions   : [12 12 24 24]
+Grid : Message : 0.004091 s : 	Reduced Dimensions : [12 12 24 12]
+Grid : Message : 0.004094 s : 	Outer strides      : [1 12 144 3456]
+Grid : Message : 0.004097 s : 	Inner strides      : [1 1 1 1]
+Grid : Message : 0.004099 s : 	iSites             : 2
+Grid : Message : 0.004101 s : 	oSites             : 41472
+Grid : Message : 0.004103 s : 	lSites             : 82944
+Grid : Message : 0.004105 s : 	gSites             : 331776
+Grid : Message : 0.004107 s : 	Nd                 : 4
+Grid : Message : 0.004109 s : ::::::::::::::::::::::::::::::::::::::::
+Grid : Message : 0.004142 s : Q=0 monitor ON: flow tau=1  |Q|<0.5 -> save trivialQ_lat.<traj>
+Grid : Message : 0.004162 s : Iwasaki gauge action beta=2.6
+Grid : Message : 0.004201 s : MD integrator=MinimumNorm2  trajL=1.6  MDsteps=24  dt=0.0666666667
+Grid : Message : 0.004209 s :  GenericHMCrunner --StartingType CheckpointStart
+Grid : Message : 0.004216 s :  GenericHMCrunner Command Line --Trajectories 800
+Grid : Message : 0.004221 s :  GenericHMCrunner --Thermalizations 10
+[scc-ne2:1597130] *** Process received signal ***
+[scc-ne2:1597130] Signal: Aborted (6)
+[scc-ne2:1597130] Signal code:  (-6)
+[scc-ne3:1567935] *** Process received signal ***
+[scc-ne3:1567935] Signal: Aborted (6)
+[scc-ne3:1567935] Signal code:  (-6)
+[scc-ne2:1597130] [ 0] /lib64/libpthread.so.0(+0x12990)[0x1523de5aa990]
+[scc-ne2:1597130] [ 1] [scc-ne3:1567935] [ 0] /lib64/libpthread.so.0(+0x12990)[0x1551905ca990]
+[scc-ne3:1567935] [ 1] /lib64/libc.so.6(gsignal+0x10f)[0x1523de2105af]
+[scc-ne2:1597130] [ 2] /lib64/libc.so.6(gsignal+0x10f)[0x1551902305af]
+[scc-ne3:1567935] [ 2] /lib64/libc.so.6(abort+0x127)[0x1523de1e3ee5]
+[scc-ne2:1597130] [ 3] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x4c7d87]
+[scc-ne2:1597130] [ 4] /lib64/libc.so.6(abort+0x127)[0x155190203ee5]
+[scc-ne3:1567935] [ 3] Grid : Error : 0.019198 s : Filename ckpoint_rng.0 not found. Aborting. 
+/projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x4ac9e5]
+[scc-ne2:1597130] [ 5] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x415b8a]
+[scc-ne2:1597130] [ 6] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x4c7d87]
+[scc-ne3:1567935] [ 4] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x4ac9e5]
+[scc-ne3:1567935] [ 5] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x415b8a]
+[scc-ne3:1567935] [ 6] [scc-nd8:1503399] *** Process received signal ***
+[scc-nd8:1503399] Signal: Aborted (6)
+[scc-nd8:1503399] Signal code:  (-6)
+/lib64/libc.so.6(__libc_start_main+0xe5)[0x1523de1fc865]
+[scc-ne2:1597130] [ 7] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x416e6e]
+[scc-ne2:1597130] *** End of error message ***
+/lib64/libc.so.6(__libc_start_main+0xe5)[0x15519021c865]
+[scc-ne3:1567935] [ 7] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x416e6e]
+[scc-ne3:1567935] *** End of error message ***
+[scc-nd8:1503399] [ 0] /lib64/libpthread.so.0(+0x12990)[0x14bfc700f990]
+[scc-nd8:1503399] [ 1] [scc-ne1:1511724] *** Process received signal ***
+[scc-ne1:1511724] Signal: Aborted (6)
+[scc-ne1:1511724] Signal code:  (-6)
+/lib64/libc.so.6(gsignal+0x10f)[0x14bfc6c755af]
+[scc-nd8:1503399] [ 2] /lib64/libc.so.6(abort+0x127)[0x14bfc6c48ee5]
+[scc-nd8:1503399] [ 3] [scc-ne1:1511724] [ 0] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x4c7d87]
+[scc-nd8:1503399] [ 4] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x4ac9e5]
+[scc-nd8:1503399] [ 5] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x415b8a]
+[scc-nd8:1503399] [ 6] /lib64/libpthread.so.0(+0x12990)[0x152339d98990]
+[scc-ne1:1511724] [ 1] /lib64/libc.so.6(__libc_start_main+0xe5)[0x14bfc6c61865]
+[scc-nd8:1503399] [ 7] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x416e6e]
+[scc-nd8:1503399] *** End of error message ***
+/lib64/libc.so.6(gsignal+0x10f)[0x1523399fe5af]
+[scc-ne1:1511724] [ 2] /lib64/libc.so.6(abort+0x127)[0x1523399d1ee5]
+[scc-ne1:1511724] [ 3] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x4c7d87]
+[scc-ne1:1511724] [ 4] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x4ac9e5]
+[scc-ne1:1511724] [ 5] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x415b8a]
+[scc-ne1:1511724] [ 6] /lib64/libc.so.6(__libc_start_main+0xe5)[0x1523399ea865]
+[scc-ne1:1511724] [ 7] /projectnb/qfe/nmatsum/dwf/build_mpi_merged/Test_hmc_IwasakiGauge_claude[0x416e6e]
+[scc-ne1:1511724] *** End of error message ***
+--------------------------------------------------------------------------
+Primary job  terminated normally, but 1 process returned
+a non-zero exit code. Per user-direction, the job has been aborted.
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+mpirun noticed that process rank 1 with PID 1597130 on node scc-ne2 exited on signal 6 (Aborted).
+--------------------------------------------------------------------------
+3 total processes killed (some possibly by mpirun during cleanup)
+mpirun exit = 134   Tue Sep  8 12:11:31 EDT 2026
+configs:
+-rw-r--r-- 1 nmatsum qfe 191103622 Sep  8 04:27 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.420
+-rw-r--r-- 1 nmatsum qfe 191103622 Sep  8 04:40 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.440
+-rw-r--r-- 1 nmatsum qfe 191103624 Sep  8 04:52 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.460
+-rw-r--r-- 1 nmatsum qfe 191103623 Sep  8 05:05 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.480
+-rw-r--r-- 1 nmatsum qfe 191103622 Sep  8 05:17 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.500
+-rw-r--r-- 1 nmatsum qfe 191103623 Sep  8 05:30 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.520
+-rw-r--r-- 1 nmatsum qfe 191103623 Sep  8 05:42 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.540
+-rw-r--r-- 1 nmatsum qfe 191103623 Sep  8 05:54 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.560
+-rw-r--r-- 1 nmatsum qfe 191103623 Sep  8 00:42 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.60
+-rw-r--r-- 1 nmatsum qfe 191103623 Sep  8 00:54 /projectnb/qfe/nmatsum/dwf/configs_iwasaki_24_b2.6/ckpoint_lat.80
+finished

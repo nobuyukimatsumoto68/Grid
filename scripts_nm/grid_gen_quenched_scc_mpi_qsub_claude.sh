@@ -19,7 +19,7 @@
 #   resume a chain that hit the walltime (continue from the last ckpoint_lat.<N>):
 #          qsub -v START=CheckpointStart,STARTTRAJ=<N> grid_gen_quenched_scc_mpi_qsub_claude.sh
 #   more nodes (e.g. 8 x 16 = 128 cores): qsub -pe mpi_16_tasks_per_node 128 -v MPIDECOMP=2.2.2.1 ...
-# Watch:   qstat -u $USER ; tail -f <OUTDIR>/gen_mpi_claude.log
+# Watch:   qstat -u $USER ; tail -f <OUTDIR>/gen_mpi_j<JOB_ID>_claude.log   (unique per run)
 
 #$ -P qfe
 ##$ -M mtsmtnbyk@gmail.com
@@ -82,12 +82,16 @@ ARGS="--grid ${GRID} --mpi ${MPIDECOMP} --threads ${THREADS}"
 ARGS="${ARGS} --StartingType ${START} --Thermalizations ${THERM} --Trajectories ${TRAJ}"
 ARGS="${ARGS} --save_interval ${SAVE} --trajL ${TRAJL} --mdsteps ${MDSTEPS}"
 if [ "${START}" = "CheckpointStart" ]; then
-  ARGS="${ARGS} --StartTrajectory ${STARTTRAJ}"
+  ARGS="${ARGS} --StartingTrajectory ${STARTTRAJ}"   # Grid flag is --StartingTrajectory (GenericHMCrunner.h:96);
+                                                     # the old --StartTrajectory was silently ignored -> read rng.0 -> abort
 fi
 
 # 1 rank per node (--map-by ppr:1:node) so each rank gets a whole 16-core node for its 16 OpenMP threads.
-echo "+ mpirun -np ${NP} --map-by ppr:1:node --bind-to none ${BIN} ${ARGS}"
-mpirun -np ${NP} --map-by ppr:1:node --bind-to none "${BIN}" ${ARGS} 2>&1 | tee gen_mpi_claude.log
+# UNIQUE per-run log ($JOB_ID) -- do NOT overwrite prior runs' logs (standing rule; the single
+# gen_mpi_claude.log was tee-truncated twice, destroying plaquette/Q history).
+GENLOG=gen_mpi_j${JOB_ID:-manual}_claude.log
+echo "+ mpirun -np ${NP} --map-by ppr:1:node --bind-to none ${BIN} ${ARGS}    (log -> ${OUTDIR}/${GENLOG})"
+mpirun -np ${NP} --map-by ppr:1:node --bind-to none "${BIN}" ${ARGS} 2>&1 | tee "${GENLOG}"
 echo "mpirun exit = ${PIPESTATUS[0]}   $(date)"
 echo "configs:"
 ls -la "${OUTDIR}"/ckpoint_lat.* 2>/dev/null | tail
