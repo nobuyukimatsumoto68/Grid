@@ -33,12 +33,26 @@ saveints=(2      4)          # as in Sungwoo's streams (m0.01 every 2 since traj
 ntrajs=(1516     4272)       # 2 x latest at start (758, 2136)
 
 GAUGE_MULT=10                # gauge-level MD multiplier (user decision 2026-10-06)
-WALL=240m
-WALL_SECONDS=14400
+# optional env overrides (defaults = production); e.g. a debug-queue test:
+#   QUEUE=pdebug WALL=30m WALL_SECONDS=1800 TPT_OVERRIDE=600 TOPDIR=/p/lustre5/matsumoto5/conf_nc4nf1_2448_cont_debug ONLY=0 bash run_prod24c_claude.sh
+# WALL=240m
+# WALL_SECONDS=14400
+WALL=${WALL:-240m}
+WALL_SECONDS=${WALL_SECONDS:-14400}
+QUEUE=${QUEUE:-pbatch}
+ONLY=${ONLY:-}               # empty = all streams; 0 = m0.01 only; 1 = m0.05 only
+# per-trajectory wall estimate (s) forwarded to the blocker; empty = submit script's own
+# (measured from prior logs, else 750 s bootstrap). Needed for short debug walls.
+TPT_OVERRIDE=${TPT_OVERRIDE:-}
+tptenv=""
+if [ -n "${TPT_OVERRIDE}" ]; then
+    tptenv="--env=TPT_OVERRIDE=${TPT_OVERRIDE}"
+fi
 APP_BIN=/usr/workspace/lsd/matsumoto5/su4_32c/Grid_sdm_build/src/gauge_gen_Nc4/bin/dweofa_mobius_HSDM_v5_gmult_claude
 
 SRCTOP=/p/lustre5/matsumoto5/conf_nc4nf1_2448
-TOPDIR=/p/lustre5/matsumoto5/conf_nc4nf1_2448_cont
+# TOPDIR=/p/lustre5/matsumoto5/conf_nc4nf1_2448_cont
+TOPDIR=${TOPDIR:-/p/lustre5/matsumoto5/conf_nc4nf1_2448_cont}
 
 basedir=$(pwd)
 xml=ip_hmc_mobius_24c_claude.xml
@@ -52,6 +66,9 @@ fi
 jmax=${#masses[@]}
 for((j=0;j<$jmax;j++))
 do
+    if [ -n "${ONLY}" ] && [ "${ONLY}" != "${j}" ]; then
+        continue
+    fi
     m=${masses[$j]}
     beta=${betas[$j]}
     massstr=${massstrs[$j]}
@@ -96,8 +113,9 @@ do
     fi
 
     echo "submitting ${cfgname} (target ${NTRAJ}, saveInterval ${saveint}, GAUGE_MULT ${GAUGE_MULT}) as ${jobname}${deps:+ (deps:${deps# })}"
-    flux batch --job-name=${jobname} ${deps} -t ${WALL} --env=NTRAJ_TARGET=${NTRAJ} --env=WALL_SECONDS=${WALL_SECONDS} \
-         --env=APP_BIN=${APP_BIN} --env=GAUGE_MULT=${GAUGE_MULT} ${script}
+    # flux batch --job-name=${jobname} ${deps} -t ${WALL} --env=NTRAJ_TARGET=${NTRAJ} --env=WALL_SECONDS=${WALL_SECONDS} \
+    flux batch --job-name=${jobname} ${deps} -q ${QUEUE} -t ${WALL} --env=NTRAJ_TARGET=${NTRAJ} --env=WALL_SECONDS=${WALL_SECONDS} \
+         --env=APP_BIN=${APP_BIN} --env=GAUGE_MULT=${GAUGE_MULT} ${tptenv} ${script}
 
     cd ${basedir}
 done
