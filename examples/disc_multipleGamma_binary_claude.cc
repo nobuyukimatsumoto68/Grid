@@ -218,6 +218,17 @@ int main (int argc, char ** argv)
         continue;
       }
     }
+    // skip trajectories with no saved gauge config (gaps in the HMC chain, e.g.
+    // b10p840: 96 -> 500). Without this, readConfiguration aborts on the missing
+    // file and every resubmit dies at the first gap. Same filesystem on every
+    // rank, so all ranks skip together (the loop body is collective).
+    {
+      const std::string path = dir+"/"+lat_prefix+std::to_string(conf);
+      if(!std::filesystem::exists(path)){
+        std::cout << GridLogMessage << "skipping conf " << conf << " (no gauge file " << path << ")" << std::endl;
+        continue;
+      }
+    }
     // graceful stop if the next config would not finish before the deadline.
     // (max_dur == 0 with no bootstrap means "no estimate yet" -> always run the
     // first config so a fresh job makes progress.)

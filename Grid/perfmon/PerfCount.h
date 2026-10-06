@@ -43,6 +43,9 @@ Author: paboyle <paboyle@ph.ed.ac.uk>
 #include <unistd.h>
 #include <sys/ioctl.h>
 
+// added
+#include <x86intrin.h>
+
 #ifdef __linux__
 #include <syscall.h>
 #include <linux/perf_event.h>
