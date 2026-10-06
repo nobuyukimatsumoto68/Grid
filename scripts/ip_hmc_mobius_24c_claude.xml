@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<!--
+  Template for dweofa_mobius_HSDM_v5_gmult_claude (Mobius EOFA HMC, SU(4) Nf=1), 24^3x48
+  light-ensemble CONTINUATION (Grid/scripts/hmc_prod24c_impl_plan_claude.md).
+  Physics values = the 32c ip_hmc_mobius_claude.xml (Ls 16, M5 1.5, b 1.5, c 0.5, no smearing).
+  Placeholders @BETA@ @MASS@ @SAVEINT@ @CFGNAME@ are filled by run_prod24c_claude.sh.
+  StartTrajectory / Trajectories are set at RUNTIME by submit_hmc_prod24c_tuolumne_claude.sh
+  (resume from the latest checkpoint in the stream dir). Gauge-level MD multiplier = env
+  GAUGE_MULT (passed by the driver), not an XML field.
+-->
+<grid>
+  <HMC>
+    <StartTrajectory>0</StartTrajectory>
+    <Trajectories>0</Trajectories>
+    <MetropolisTest>true</MetropolisTest>
+    <NoMetropolisUntil>0</NoMetropolisUntil>
+    <StartingType>CheckpointStart</StartingType>
+    <PerformRandomShift>false</PerformRandomShift>
+    <MD>
+      <name>MinimumNorm2</name>
+      <MDsteps>16</MDsteps>
+      <trajL>1.0</trajL>
+    </MD>
+  </HMC>
+  <Checkpointer>
+    <config_prefix>./@CFGNAME@_lat</config_prefix>
+    <rng_prefix>./@CFGNAME@_rng</rng_prefix>
+    <saveInterval>@SAVEINT@</saveInterval>
+    <saveSmeared>false</saveSmeared>
+    <smeared_prefix>./@CFGNAME@_lat_smr</smeared_prefix>
+    <format>IEEE64BIG</format>
+  </Checkpointer>
+  <RandomNumberGenerator>
+    <serial_seeds>1 2 3 4 5</serial_seeds>
+    <parallel_seeds>6 7 8 9 10</parallel_seeds>
+  </RandomNumberGenerator>
+  <Action>
+    <gauge_beta>@BETA@</gauge_beta>
+    <Mobius>
+        <Ls>16</Ls>
+        <mass>@MASS@</mass>
+        <M5>1.5</M5>
+        <b>1.5</b>
+        <c>0.5</c>
+        <StoppingCondition>1e-10</StoppingCondition>
+        <MaxCGIterations>30000</MaxCGIterations>
+        <ApplySmearing>false</ApplySmearing>
+    </Mobius>
+  </Action>
+</grid>
