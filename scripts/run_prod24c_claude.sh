@@ -25,12 +25,18 @@ set -u
 
 # NTRAJ=${NTRAJ:?set NTRAJ=<overall target trajectory number>}
 
-masses=(0.01     0.05)
-betas=(10.8      10.84)
-massstrs=(0p0100 0p0500)
-betastrs=(10p800 10p840)
-saveints=(2      4)          # as in Sungwoo's streams (m0.01 every 2 since traj 74; m0.05 every 4)
-ntrajs=(1516     4272)       # 2 x latest at start (758, 2136)
+# masses=(0.01     0.05)
+# betas=(10.8      10.84)
+# massstrs=(0p0100 0p0500)
+# betastrs=(10p800 10p840)
+# saveints=(2      4)          # as in Sungwoo's streams (m0.01 every 2 since traj 74; m0.05 every 4)
+# ntrajs=(1516     4272)       # 2 x latest at start (758, 2136)
+masses=(0.01     0.05     0.1)
+betas=(10.8      10.84    10.865)
+massstrs=(0p0100 0p0500   0p1000)
+betastrs=(10p800 10p840   10p865)
+saveints=(2      4        20)  # as in Sungwoo's streams (m0.01 every 2 since traj 74; m0.05 every 4; m0.1 every 20)
+ntrajs=(1516     4272     8300) # m0.01/m0.05: 2 x latest at start (758, 2136); m0.1: 4640 + 183 cfgs x 20 (2 x configs)
 
 GAUGE_MULT=10                # gauge-level MD multiplier (user decision 2026-10-06)
 # optional env overrides (defaults = production); e.g. a debug-queue test:
@@ -40,7 +46,7 @@ GAUGE_MULT=10                # gauge-level MD multiplier (user decision 2026-10-
 WALL=${WALL:-240m}
 WALL_SECONDS=${WALL_SECONDS:-14400}
 QUEUE=${QUEUE:-pbatch}
-ONLY=${ONLY:-}               # empty = all streams; 0 = m0.01 only; 1 = m0.05 only
+ONLY=${ONLY:-}               # empty = all streams; 0 = m0.01 only; 1 = m0.05 only; 2 = m0.1 only
 # per-trajectory wall estimate (s) forwarded to the blocker; empty = submit script's own
 # (measured from prior logs, else 750 s bootstrap). Needed for short debug walls.
 TPT_OVERRIDE=${TPT_OVERRIDE:-}
