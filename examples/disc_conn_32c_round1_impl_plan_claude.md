@@ -42,6 +42,28 @@ fit check (USER runs). No source change.
 Files: (decision; feeds all submit_* scripts below). NO code.
 
 ### CHUNK 1 -- DISC_TPART K-partition time dilution (workstream 1)
+STATUS: CODE + SCRIPTS DONE (2026-07-21), NOT YET COMPILED/RUN. Implemented:
+header `StochasticDilutedSource` gains optional (tpart=1, Nt=0) args (default =
+bit-identical original, same bernoulli stream; K>1 puts the SAME Z4 field on the K
+slices {t + k*Nt/K}); both disc binaries read `DISC_TPART` (assert K|Nt, tbase loop
+Nt/K) + `DISC_SEED_STR` (RNG seed suffix, K-scan resampling only, ""=production
+unchanged) + always print `# LOOPP0 <gam> conf <c> t <t> re im` after the trace write
+(log-based analysis; also a free unbiasedness monitor in production). 1d scan =
+`run_disc_tpart_scan_claude.sh` (3 pbatch jobs K=1/2/4, NSEEDS=4 noise streams on
+lat.1200 @ lma_v2 NEV=20) + `analyze_tpart_scan_claude.py` (noise var-ratio, FoM
+F_K = (var_K/var_1)(T_K/T_1), bias-z; gauge variance only favors larger K; PLUS the
+same-noise PAIRING-SPIKE check -- slices sharing a solve share noise, so the disc 2pt
+<L(t)L(t+dt)> is BIASED at dt = multiples of Nt/K; the analyzer estimates the noise
+covariance vs dt over seeds and flags the spike vs background).
+K POLICY BY MASS (user 2026-07-21): HEAVY m>=0.1 -> K from this scan (spike
+exponentially dead, but measured not assumed). LIGHT m=0.01/0.05 (24c production AND
+32c round 2) -> K=1 DEFAULT; K=4 EXCLUDED (user: no contact spike at Nt/4); K=2 only
+if a dedicated LIGHT-mass K-scan (same scripts pointed at 24c m0.01; conservative
+proxy for 32c whose larger Nt separates slices further) shows the dt=Nt/2 spike
+invisible.
+Build: `make -C build/examples disc_multipleGamma_binary_lma_v2_claude
+disc_multipleGamma_binary_mixedprec_claude baryons_0000_dirac_lma_claude` (header
+touched -> conn binary rebuild too; no Make.inc change).
 1a. `disc_lma_v2_common_claude.h`: `StochasticDilutedSource` gains `(Nt, tpart, tbase)`;
     mask = OR over $k=0..tpart-1$ of `(t == tbase + k*Nt/tpart)`. tpart=1 -> current.
 1b. `disc_multipleGamma_binary_lma_v2_claude.cc`: read `DISC_TPART` env; outer loop
@@ -57,6 +79,52 @@ Files: `disc_lma_v2_common_claude.h`, `disc_multipleGamma_binary_lma_v2_claude.c
 `submit_disc_tpart_scan_claude.sh`, analysis cell in an ipynb / `*_tpart_results_claude.md`.
 
 ### CHUNK 2 -- deflation/LMA spectrum probe + break-even on heavy m=0.1 (then 0.2)
+VERDICT (2026-07-21, eigref f3MYawbisfqh + bench f3MYvtaUBy9q, m=0.1 lat.1200,
+16N/64r mpi 2.2.2.8): **MIXED-PREC WINS AT HEAVY MASS -- use it for ALL of m=0.1-0.4.**
+- Spectrum: lambda_min=0.0239 (sigma_min=0.155 ~ the quark-mass scale), lambda_max=81.6,
+  Nconv=114 in 1030 s shift-invert. GAPPED: NEV=100 covers only lambda<=0.028 -> no
+  low-mode dominance -> no variance win possible (contrast m=0.01: same machinery = 
+  ~30x error win on conn, ~5x disc speedup).
+- Timing (8-group DISC_NGROUPS samples): T_mp=28.9 s/group; T_proj=26.1 s/group (both
+  NEV=50 and 100 -- deflation shaves ~9%); T_eig+T_A2A = 121 s (NEV=50) / 247 s (NEV=100).
+  Per config (128 groups): mixedprec 3700 s vs LMA 3460-3590 s -> <=6% net, single-sample
+  jitter territory. NOT worth the eigref/window/NEV machinery at heavy mass.
+- OQ2 ANSWERED: gap grows with mass -> no bench needed at 0.2-0.4, mixedprec everywhere.
+- CHUNK-0/OQ1 ANSWERED: 16N/64r (2.2.2.8) fits INCLUDING the NM=240 eigensolve store
+  (no AccCache trip) -> heavy production layout = 16N/64r. Heavy disc cost: ~62 min/config
+  at 16N (K=1) -> ~31 min with DISC_TPART=2; 4-ensemble campaign ~170 node-days.
+SHALLOW-NEV SWEEP DONE (2026-07-21, f3MZJtQhAqy9). Full m=0.1 table (s/config, 128
+groups, 16N): mixedprec 3699 | NEV=10: 31+128*27.2=3509 (-5.1%) | **NEV=20:
+48+128*26.6=3448 (-6.8%, SWEET SPOT)** | NEV=50: 3462 | NEV=100: 3588. T_proj plateau
+(26.1-26.6) holds down to NEV=20, degrades at 10 -> the deflation win is the lowest
+~20 modes. FINAL BINARY MATRIX (user-confirmed 2026-07-21):
+- disc m=0.1  = lma_v2 @ NEV=20 (NSTOP=20 NK=40 NM=80; env only, traces drop-in).
+- disc m=0.2-0.4 = mixedprec.
+- conn m=0.1  = baryons_0000_dirac_lma_claude Phase A @ NEV=20 (STANDALONE: own 37 s
+  eigensolve per config, NO evec checkpointing/coupling to disc -- transfer costs more
+  than the eigensolve at this depth; CONN_LMA_FULL=0, gapped spectrum). ~70 s/config vs
+  ~60-120 s plain; outer tol 1e-8 = the 32c conn standard (vs 1e-9 24c refs; measured
+  ~2e-7 on correlators, far below stats). First config runs CONN_COMPARE_PLAIN=1.
+- conn m=0.2-0.4 = plain reference binary (win would be minutes; keep uniform; can flip
+  to the deflated binary by submit-script edit if m=0.2 conn measures slow).
+Validation gate: one m=0.1 config LMA vs mixedprec disc traces within stochastic error
+(chunk 4). NO evec disk I/O anywhere in round 1.
+NEXT: chunk 1 (DISC_TPART + K-scan) then chunk 3 production drivers.
+Original approach note: scripts were READY 2026-07-21 morning, run same day. Approach revised from
+the original estimator-bench plan: the estimator bench's NSRC samples are full
+dilution passes with UNBATCHED double CGs (both estimators) -- affordable on the 4^4
+testbed, prohibitive on a real 32c config. The 32c break-even is therefore
+TIMING-FIRST via DISC_NGROUPS timing mode (added to the mixedprec binary 2026-07-21,
+default OFF, along with CONF_MIN/MAX/STRIDE env -- needed for chunk 3 anyway):
+- `submit_disc_eigref_32c_claude.sh`: eigref on latest m=0.1 config, 16N/64r
+  (2.2.2.8) = the chunk-0 fit check for the eigensolve (~8 GB/GPU evec store);
+  pdebug -N 16, pbatch fallback; -> eigref_3264_b10p865_m0p1000.h5. The SPECTRUM
+  (gap size vs m=0.01) is the variance-side verdict.
+- `submit_disc_bench_32c_claude.sh`: one-config symlink dir, 3 phases at 8 groups:
+  mixedprec baseline / lma NEV=50 / lma NEV=100 -> LMA wins iff
+  T_eig+T_A2A+128*T_proj < 128*T_mp. Stale-binary guard included.
+Build: `make -C build/examples disc_multipleGamma_binary_mixedprec_claude
+disc_multipleGamma_binary_lma_v2_claude` (no Make.inc change, no regen).
 2a. New submit scripts at the chunk-0 layout pointing at the m=0.1 config path (binaries
     unchanged, just `--grid` + path): eigref + estimator bench + gates.
 2b. eigref on one m=0.1 config -> spectrum (lambda_min, density below a cut, lambda_max)
@@ -69,6 +137,21 @@ Files: new `submit_disc_eigref_32c_claude.sh`, `submit_disc_estbench_32c_claude.
 `run_disc_defl_probe_32c_claude.sh`, eigref h5 output, `*_defl_threshold_results_claude.md`.
 
 ### CHUNK 3 -- heavy production drivers (disc + conn), per the threshold finding
+STATUS: SCRIPTS DONE (2026-07-21), awaiting launch. K=2 EVERYWHERE (user 2026-07-21:
+"K=2 for both" heavy AND light; at K=2 the same-noise pairing bias sits only at the
+ANTIPODAL dt=Nt/2 -- flag/drop in analysis; K-scan jobs cancelled as moot; the RUNNING
+24c chains stay K=1 as launched). OQ4 RESOLVED: obs dirs =
+/p/lustre5/matsumoto5/obs_nc4nf1_3264/obs_nc4nf1_3264_b<beta>_m<mass>, conn+disc
+SHARE the dir (24c pattern). Files: generic env-driven `submit_disc_32c_claude.sh` +
+`run_disc_32c_claude.sh` (chain driver, 4 ensembles, binary matrix + TPT via --env,
+16N/64r, -t 240m backfill-friendly, stale-binary guards) and `submit_conn_32c_claude.sh`
++ `run_conn_32c_claude.sh` (same pattern; first-ever m0.1 conn job auto-enables
+CONN_COMPARE_PLAIN=1 -> in-binary gate on every config it completes, chain continues
+without it once mesons_conn files exist). OQ3 RESOLVED: conn m0.1 deflated @1e-8,
+conn m0.2-0.4 plain 1e-9 reference binary. CONF_MIN not set (starts at lat.20) --
+run the plaquette thermalization check before/alongside the first jobs; overridable
+per ensemble via extra --env=CONF_MIN=... without script edits (disc binaries only;
+plain conn uses --stride/native range).
 3a. disc: masses where deflation LOSES -> mixedprec binary (+ DISC_TPART); where it WINS
     -> lma_v2 binary (+ eigref + DISC_TPART). Driver loops 0.1-0.4, NATIVE stride 20,
     wall blocker, internal self-skip, flux auto-chain. New `run_disc_32c_claude.sh` +

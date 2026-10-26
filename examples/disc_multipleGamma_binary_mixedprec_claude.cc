@@ -2,6 +2,7 @@
 #include <getopt.h>
 #include <ctime>    // std::time for the wall-time blocker
 #include <cstdlib>  // std::getenv / std::atol for the wall-time blocker
+#include <cassert>  // DISC_TPART divisibility assert (chunk 1)
 
 #include <Grid/Grid.h>
 
@@ -52,8 +53,12 @@ inline bool is_exist (const std::string& name) {
 return ( access( name.c_str(), F_OK ) != -1 );
 }
 
+// CHUNK-1 (round-1 plan): K-partition TIME dilution knob, same semantics as the header
+// version in disc_lma_v2_common_claude.h -- tpart=1 (default) is bit-identical to the
+// original; tpart=K puts the same Z4 noise on the K slices {tslice + k*Nt/K}.
 void StochasticDilutedSource(GridParallelRNG &RNG, LatticePropagator &source,
-                             GridBase *rbgrid, const int tslice, const int eo)
+                             GridBase *rbgrid, const int tslice, const int eo,
+                             const int tpart = 1, const int Nt = 0)
 {
   GridBase *grid = source.Grid();
   RealD nrm = 1.0/sqrt(2.0);
@@ -63,6 +68,7 @@ void StochasticDilutedSource(GridParallelRNG &RNG, LatticePropagator &source,
 
   LatticeComplex zz(grid);    zz    = Zero();
   LatticeComplex xi(grid);
+  LatticeComplex xim(grid);
   LatticeComplex xi_rb(rbgrid);
   LatticeComplex xi_eo(grid);
 
@@ -71,7 +77,17 @@ void StochasticDilutedSource(GridParallelRNG &RNG, LatticePropagator &source,
     for(int c=0; c<Nc; c++){
       bernoulli(RNG, xi);
       xi = (2.0*xi - Complex(1.0,1.0))*nrm;
-      xi = where(t==Integer(tslice), xi, zz);
+      // xi = where(t==Integer(tslice), xi, zz);   // original single-slice mask (tpart==1 path below)
+      if(tpart <= 1){
+        xi = where(t==Integer(tslice), xi, zz);
+      } else {
+        xim = Zero();
+        for(int k=0; k<tpart; k++){
+          const int tk = tslice + k*(Nt/tpart);
+          xim = where(t==Integer(tk), xi, xim);
+        }
+        xi = xim;
+      }
 
       xi_eo = Zero();
       pickCheckerboard(eo, xi_rb, xi);
@@ -227,9 +243,30 @@ int main (int argc, char ** argv)
     conf_min = confs.front();
     interval = (confs.size() >= 2) ? confs[1] - confs[0] : 1;
     conf_max = confs.back() + interval;
+    // env overrides for the MEASUREMENT set (as in the lma_v2 binary): CONF_MIN skips
+    // thermalization, CONF_STRIDE picks the decorrelated subset, CONF_MAX caps the range.
+    if(const char* e = std::getenv("CONF_MIN"))     conf_min = std::atoi(e);
+    if(const char* e = std::getenv("CONF_MAX"))     conf_max = std::atoi(e);
+    if(const char* e = std::getenv("CONF_STRIDE")){ int s = std::atoi(e); if(s > 0) interval = s; }
   }
   std::cout << "conf_min=" << conf_min << " conf_max=" << conf_max
             << " interval=" << interval << std::endl;
+
+  // DISC_NGROUPS: 0 = all Nt*2 (t,eo) dilution groups (PRODUCTION). >0 = TIMING MODE -- do only
+  // the first N groups and SKIP the trace write (a partial loop is NOT a valid output; this
+  // measures the per-group mixed-batched solve wall, e.g. for the 32c break-even bench).
+  int ngroups_max = 0;
+  { const char* e = std::getenv("DISC_NGROUPS"); if(e) ngroups_max = std::atoi(e); }
+
+  // CHUNK-1 knobs (round-1 plan), same semantics as the lma_v2 binary: DISC_TPART=K
+  // sources K equally-spaced slices per solve (default 1 = original); DISC_SEED_STR
+  // (default empty) appended to the per-config RNG seed -- K-scan resampling only.
+  int tpart = 1;
+  { const char* e = std::getenv("DISC_TPART"); if(e) tpart = std::atoi(e); }
+  assert(tpart >= 1 && (Nt % tpart) == 0 && "DISC_TPART must divide Nt");
+  std::string seed_suffix = "";
+  { const char* e = std::getenv("DISC_SEED_STR"); if(e) seed_suffix = e; }
+  if(tpart > 1) std::cout << GridLogMessage << "# DISC_TPART=" << tpart << std::endl;
 
 
   const std::vector<Gamma::Algebra> gams = {
@@ -297,7 +334,8 @@ int main (int argc, char ** argv)
       const std::string path = dir+"/"+lat_prefix+std::to_string(conf);
       FieldMetaData header;
       NerscIO::readConfiguration(Umu, header, path);
-      RNG4.SeedUniqueString(path);
+      // RNG4.SeedUniqueString(path);   // original; DISC_SEED_STR="" reproduces it exactly
+      RNG4.SeedUniqueString(path + seed_suffix);
     }
     // refresh the single-precision gauge copy for this config's inner solves.
     precisionChange(Umu_f, Umu);
@@ -308,11 +346,14 @@ int main (int argc, char ** argv)
     std::vector<LatticeComplex> res(gam_names.size(), LatticeComplex(UGrid));
     for(auto &r : res) r = Zero();
 
-    for(int t=0; t<Nt; t++){
-      for(int eo=0; eo<=1; eo++){
+    int ngroups_done = 0;
+    // DISC_TPART=K: each solve sources K slices {t + k*Nt/K} -> tbase loop runs Nt/K.
+    for(int t=0; t<Nt/tpart && (ngroups_max==0 || ngroups_done<ngroups_max); t++){
+      for(int eo=0; eo<=1 && (ngroups_max==0 || ngroups_done<ngroups_max); eo++){
         LatticePropagator source(UGrid);
 
-        StochasticDilutedSource(RNG4, source, UrbGrid, t, eo);
+        // StochasticDilutedSource(RNG4, source, UrbGrid, t, eo);   // original single-slice call
+        StochasticDilutedSource(RNG4, source, UrbGrid, t, eo, tpart, Nt);
 
         LatticePropagator StochProp(UGrid);
         Solve(FermAct, FermAct_f, source, StochProp);
@@ -322,9 +363,13 @@ int main (int argc, char ** argv)
           TraceField(Trace_CF, gams[ig], StochProp, source);
           res[ig] = res[ig] + Trace_CF;
         }
+        ngroups_done++;
       }
     } // for dilute
 
+    // Skip the trace write in timing mode (partial loop -> not a valid measurement; do not
+    // leave traces that would self-skip a later real run).
+    if(ngroups_max == 0){
     for(int ig=0; ig<(int)gam_names.size(); ig++){
       const std::string path = obsdir + "/traces." + gam_names[ig] + "." + std::to_string(conf);
       emptyUserRecord record;
@@ -332,6 +377,20 @@ int main (int argc, char ** argv)
       WR.open(path);
       WR.writeScidacFieldRecord(res[ig], record);
       WR.close();
+    }
+    // p=0 loop per (gamma,t) to the log: cheap; the K-scan variance analysis +
+    // unbiasedness cross-check read these lines instead of the Scidac fields.
+    for(int ig=0; ig<(int)gam_names.size(); ig++){
+      std::vector<TComplex> tv;
+      sliceSum(res[ig], tv, Tdir);
+      for(int tt=0; tt<Nt; tt++)
+        std::cout << GridLogMessage << "# LOOPP0 " << gam_names[ig] << " conf " << conf
+                  << " t " << tt << " " << real(TensorRemove(tv[tt]))
+                  << " " << imag(TensorRemove(tv[tt])) << std::endl;
+    }
+    } else {
+      std::cout << GridLogMessage << "TIMING MODE: did " << ngroups_done << "/" << (Nt*2)
+                << " (t,eo) groups, NO traces written" << std::endl;
     }
 
     // update the per-config wall-time estimate for the blocker. Measure on the

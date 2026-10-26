@@ -15,8 +15,15 @@
 // Shared machinery: disc_lma_v2_common_claude.h. Never edit the original disc binary.
 //
 // Decisions: RNG4 = SeedUniqueString(config_path) per config; output = combined LMA loop only;
-// NO evec checkpoint (evecs stay in memory). Knobs: INNER_TOL/MAXINNER/MAXOUTER/MAXPATCH (mixed CG)
+// evecs stay in memory BY DEFAULT. Knobs: INNER_TOL/MAXINNER/MAXOUTER/MAXPATCH (mixed CG)
 // + the eigensolve env (ReadLMAEigParams).
+//
+// CHUNK 0 (conn_lma_impl_plan_claude.md), all default OFF -> default behavior unchanged:
+//   eval.<conf>.h5 ALWAYS written to obsdir after the eigensolve (tiny; spectrum QA offline).
+//   EVEC_LOAD=1  try the evec checkpoint before eigensolving (skip BuildLowModes on hit);
+//   EVEC_SAVE=1  write the evec checkpoint after the eigensolve (Scidac records, EVEC_DIR
+//                default obsdir -- the submit script MUST `lfs setstripe -c -1 -S 16M` it);
+//   EVEC_PREC    single (default: .scidacf records, half the I/O, RR re-refine on load) | double.
 //
 // LMA: DeGrand-Schaefer hep-lat/0401011; Giusti et al hep-lat/0402002. A2A: Foley et al hep-lat/0505023.
 
@@ -76,6 +83,26 @@ int main(int argc, char** argv)
   // just to measure the per-projected-solve wall quickly on pdebug, confirming the ~3-4x speedup).
   const int ngroups_max = env_int("DISC_NGROUPS", 0);
 
+  // ---- CHUNK-1 knobs (round-1 plan): K-partition time dilution + scan seed suffix ----
+  // DISC_TPART=K sources K equally-spaced slices per solve (factor K fewer solves);
+  // default 1 = original behavior. DISC_SEED_STR (default empty) is appended to the
+  // per-config RNG seed string -- ONLY for the K-scan noise resampling; production
+  // leaves it unset so the noise stream is unchanged.
+  const int tpart = env_int("DISC_TPART", 1);
+  const char* seed_suffix_e = std::getenv("DISC_SEED_STR");
+  const std::string seed_suffix = seed_suffix_e ? seed_suffix_e : "";
+
+  // ---- CHUNK-0 evec-checkpoint knobs (see header comment; all default OFF) ----
+  const int evec_save = env_int("EVEC_SAVE", 0);
+  const int evec_load = env_int("EVEC_LOAD", 0);
+  int evec_prec = 1;   // 1 = single (.scidacf, D-IO default), 2 = double (.scidac)
+  if(const char* e = std::getenv("EVEC_PREC")){
+    const std::string s(e);
+    if(s == "double" || s == "2") evec_prec = 2;
+  }
+  std::string evec_dir = obsdir;
+  if(const char* e = std::getenv("EVEC_DIR")) evec_dir = e;
+
   // ---- double + single grids -------------------------------------------------
   GridCartesian         * UGrid   = SpaceTimeGrid::makeFourDimGrid(GridDefaultLatt(),
                                        GridDefaultSimd(Nd,vComplex::Nsimd()), GridDefaultMpi());
@@ -91,11 +118,17 @@ int main(int argc, char** argv)
 
   const int Nt = UGrid->_fdimensions[Tdir];
 
+  assert(tpart >= 1 && (Nt % tpart) == 0 && "DISC_TPART must divide Nt");
+
   std::cout << GridLogMessage << "# disc LMA production v2 (mixed-batched): mass=" << mass << " beta=" << beta
-            << " Nt=" << Nt << " dir=" << dir << " obsdir=" << obsdir
+            << " Nt=" << Nt << " tpart=" << tpart << " dir=" << dir << " obsdir=" << obsdir
             << " eigref=" << eigref << std::endl;
 
   std::filesystem::create_directories(obsdir);
+  if(evec_dir != obsdir) std::filesystem::create_directories(evec_dir);   // eval/evec files land here
+  if(evec_save || evec_load)
+    std::cout << GridLogMessage << "# evec checkpoint: save=" << evec_save << " load=" << evec_load
+              << " prec=" << (evec_prec==1?"single":"double") << " dir=" << evec_dir << std::endl;
 
   // ---- per-ENSEMBLE spectral landscape (Cheby window); computed once by disc_lma_eigref_v2 ----
   std::vector<RealD> lambda_ref;
@@ -194,7 +227,8 @@ int main(int argc, char** argv)
     {
       FieldMetaData header;
       NerscIO::readConfiguration(Umu, header, cfg_path);
-      RNG4.SeedUniqueString(cfg_path);
+      // RNG4.SeedUniqueString(cfg_path);   // original; DISC_SEED_STR="" reproduces it exactly
+      RNG4.SeedUniqueString(cfg_path + seed_suffix);
     }
     precisionChange(Umu_f, Umu);
 
@@ -203,15 +237,54 @@ int main(int argc, char** argv)
     SchurDiagMooeeOperator<FermionAction,  LatticeFermion>  HermOpEO  (D);
     SchurDiagMooeeOperator<FermionActionF, LatticeFermionF> HermOpEO_f(D_f);
 
-    // ---- eigenbasis: eigensolve (Cheby+RR) per config; evecs stay in MEMORY, NO disk
-    // checkpoint. Saving ~100 GB of double evecs/config to skip a ~120s eigensolve on a
-    // resume is a net loss (huge disk + ~minutes of I/O per config); the eigensolve is cheap
-    // to redo. SaveEvecs/LoadEvecs remain in the header (reusable for conn LMA / deflation). ----
+    // ---- eigenbasis: default UNCHANGED -- eigensolve (Cheby+RR) per config, evecs in MEMORY.
+    // (The old "checkpoint is a net loss" verdict assumed DOUBLE evecs on an UNSTRIPED dir;
+    // with single-prec records + striping the read is ~10x cheaper than the eigensolve --
+    // conn_lma_impl_plan_claude.md D-IO. Default stays OFF; the chunk-2 timing gate decides.)
+    // The checkpoint exists for CONSUMERS that cannot amortize the eigensolve (standalone conn
+    // LMA: 16 point solves) and for reruns. The LMA split stays exact for WHATEVER subspace is
+    // used (u_i rebuilt from sub in the A2A stream), so a single-prec-stored basis changes the
+    // variance split only, never the mean (estimator-bench mode-accuracy result).
     std::vector<LatticeFermion> sub;
     std::vector<RealD>          eval_use;
-    BuildLowModes(D, D_f, HermOpEO, HermOpEO_f, P, have_ref, lambda_ref, lambda_max_ref, sub, eval_use);
-    std::cout << GridLogMessage << "# conf " << conf << " eigensolved " << sub.size()
-              << " modes (in memory, no checkpoint)" << std::endl;
+    const std::string evec_file = evec_dir + "/evec." + std::to_string(conf)
+                                + (evec_prec == 1 ? ".scidacf" : ".scidac");
+    // evals live NEXT TO the evec records so a consumer pointing EVEC_DIR at the producer's
+    // dir finds both; with the default EVEC_DIR=obsdir this is the plan's obsdir eval.<conf>.h5.
+    const std::string eval_file = evec_dir + "/eval." + std::to_string(conf) + ".h5";
+    bool loaded = false;
+    if(evec_load){
+      double t0 = usecond();
+      loaded = LoadEvecRecords(evec_file, eval_file, evec_prec, FrbGrid, FrbGrid_f, sub, eval_use);
+      if(loaded){
+        std::cout << GridLogMessage << "# conf " << conf << " LoadEvecRecords: " << sub.size()
+                  << " modes (prec=" << (evec_prec==1?"single":"double")
+                  << ") wall=" << (usecond()-t0)*1.0e-6 << " s" << std::endl;
+        if(evec_prec == 1 && P.rr_refine){
+          std::cout << GridLogMessage << "# RR re-refining single-prec checkpoint in double..." << std::endl;
+          double t1 = usecond();
+          RayleighRitzRefine(HermOpEO, sub, eval_use);
+          std::cout << GridLogMessage << "# RR re-refine wall=" << (usecond()-t1)*1.0e-6 << " s" << std::endl;
+          SaveEvals(eval_file, eval_use, UGrid);   // refresh evals with the refined values
+        }
+      } else {
+        std::cout << GridLogMessage << "# conf " << conf << " no evec checkpoint (" << evec_file
+                  << ") -> eigensolving" << std::endl;
+      }
+    }
+    if(!loaded){
+      double t0 = usecond();
+      BuildLowModes(D, D_f, HermOpEO, HermOpEO_f, P, have_ref, lambda_ref, lambda_max_ref, sub, eval_use);
+      std::cout << GridLogMessage << "# conf " << conf << " eigensolved " << sub.size()
+                << " modes, BuildLowModes wall=" << (usecond()-t0)*1.0e-6 << " s" << std::endl;
+      SaveEvals(eval_file, eval_use, UGrid);   // eval checkpoint: ALWAYS (tiny)
+      if(evec_save){
+        double t1 = usecond();
+        SaveEvecRecords(evec_file, evec_prec, FrbGrid_f, sub);
+        std::cout << GridLogMessage << "# conf " << conf << " SaveEvecRecords wall="
+                  << (usecond()-t1)*1.0e-6 << " s -> " << evec_file << std::endl;
+      }
+    }
 
     // Per-mode physical A2A, STREAMED to bound peak device memory. The exact-low part L^low
     // consumes each (a_i,b_i) only transiently (one inner-product accumulation), but the
@@ -247,11 +320,13 @@ int main(int argc, char** argv)
 
     // source-projected stochastic high part: full time+eo+sc dilution, low modes projected out.
     // DISC_NGROUPS>0 stops after the first N (t,eo) groups (timing mode).
+    // DISC_TPART=K: each solve sources K slices {t + k*Nt/K} -> tbase loop runs Nt/K.
     int ngroups_done = 0;
-    for(int t=0; t<Nt && (ngroups_max==0 || ngroups_done<ngroups_max); t++){
+    for(int t=0; t<Nt/tpart && (ngroups_max==0 || ngroups_done<ngroups_max); t++){
       for(int eo=0; eo<=1 && (ngroups_max==0 || ngroups_done<ngroups_max); eo++){
         LatticePropagator source(UGrid);
-        StochasticDilutedSource(RNG4, source, UrbGrid, t, eo);
+        // StochasticDilutedSource(RNG4, source, UrbGrid, t, eo);   // original single-slice call
+        StochasticDilutedSource(RNG4, source, UrbGrid, t, eo, tpart, Nt);
 
         LatticePropagator StochPropHigh(UGrid);
         SolvePropProjectedMixedBatched(D, D_f, HermOpEO, HermOpEO_f, u, source, StochPropHigh,
@@ -277,6 +352,16 @@ int main(int argc, char** argv)
         WR.open(path);
         WR.writeScidacFieldRecord(res[ig], record);
         WR.close();
+      }
+      // p=0 loop per (gamma,t) to the log: cheap, and the K-scan variance analysis +
+      // unbiasedness cross-check read these lines instead of the Scidac fields.
+      for(int ig=0; ig<ngam; ig++){
+        std::vector<TComplex> tv;
+        sliceSum(res[ig], tv, Tdir);
+        for(int tt=0; tt<Nt; tt++)
+          std::cout << GridLogMessage << "# LOOPP0 " << gam_names[ig] << " conf " << conf
+                    << " t " << tt << " " << real(TensorRemove(tv[tt]))
+                    << " " << imag(TensorRemove(tv[tt])) << std::endl;
       }
     } else {
       std::cout << GridLogMessage << "# TIMING MODE: did " << ngroups_done << "/" << (Nt*2)

@@ -515,8 +515,16 @@ inline void BuildA2ASet(MobiusFermionD &D,
 // ============================================================================
 
 // ---- Z4 time+eo diluted source (from the reference disc binary) ----
+// CHUNK-1 (disc_conn_32c_round1_impl_plan_claude.md): K-partition TIME dilution knob.
+// tpart=1 (default) = the original single-slice source, bit-identical (same bernoulli
+// stream). tpart=K>1 puts the SAME Z4 noise field on the K equally-spaced slices
+// {tslice + k*Nt/K}, so one solve covers K slices -> factor K fewer solves per config.
+// Unbiased: the cross terms between slices are mean-zero over the noise; the variance
+// penalty ~ K*|S(Nt/K)|^2 is exponentially suppressed at heavy mass (short correlation
+// length). Nt is required only when tpart>1.
 inline void StochasticDilutedSource(GridParallelRNG &RNG, LatticePropagator &source,
-                                    GridBase *rbgrid, const int tslice, const int eo)
+                                    GridBase *rbgrid, const int tslice, const int eo,
+                                    const int tpart = 1, const int Nt = 0)
 {
   GridBase *grid = source.Grid();
   RealD nrm = 1.0/std::sqrt(2.0);
@@ -526,6 +534,7 @@ inline void StochasticDilutedSource(GridParallelRNG &RNG, LatticePropagator &sou
 
   LatticeComplex zz(grid);    zz = Zero();
   LatticeComplex xi(grid);
+  LatticeComplex xim(grid);
   LatticeComplex xi_rb(rbgrid);
   LatticeComplex xi_eo(grid);
 
@@ -534,7 +543,17 @@ inline void StochasticDilutedSource(GridParallelRNG &RNG, LatticePropagator &sou
     for(int col=0; col<Nc; col++){
       bernoulli(RNG, xi);
       xi = (2.0*xi - Complex(1.0,1.0))*nrm;
-      xi = where(t==Integer(tslice), xi, zz);
+      // xi = where(t==Integer(tslice), xi, zz);   // original single-slice mask (tpart==1 path below)
+      if(tpart <= 1){
+        xi = where(t==Integer(tslice), xi, zz);
+      } else {
+        xim = Zero();
+        for(int k=0; k<tpart; k++){
+          const int tk = tslice + k*(Nt/tpart);
+          xim = where(t==Integer(tk), xi, xim);
+        }
+        xi = xim;
+      }
 
       xi_eo = Zero();
       pickCheckerboard(eo, xi_rb, xi);
@@ -778,6 +797,120 @@ inline bool LoadEvecs(const std::string& evec_file, const std::string& eval_file
   for(int k=0; k<n; k++){
     sub[k].Checkerboard() = Odd;
     RD.readScidacFieldRecord(sub[k], record);
+  }
+  RD.close();
+  return true;
+}
+
+// ============================================================================
+//  CHUNK-3 Phase-B piece (conn_lma_impl_plan_claude.md): time-sliced PAIR spin matrix.
+//  SlicePairSpinMatrix(f_l, f_r) -> out[t]^{s1 s2} = sum_{x in slice t} sum_c
+//     f_l(x)^{s1 c} conj(f_r(x)^{s2 c})     (colour-traced spin outer product).
+//  KEY CONTRACTION IDENTITY (fixes all conventions; validated by the in-binary Phase-B
+//  DET gate): for any spin matrix X,
+//     sum_{x in t} f_r^dag(x) X f_l(x)  =  tr[ X * out[t] ].
+//  The all-source low-mode meson 2pt is assembled from these pair matrices over the
+//  physical A2A set (a_i, b_i): A^{ch}_{ij}(t)=a_i^dag(G5 Gsnk)a_j -> tr[Gt*SPa_{ji}],
+//  B^{ch}_{ji}(t)=b_j^dag(adj(Gsrc)G5)b_i -> tr[Xs*SPb_{ij}] (channel loop in the conn
+//  binary, which owns the channel table). Costs ONE big kernel + one sliceSum per pair;
+//  the SpinColourMatrix intermediate is caller-provided so the allocation is reused.
+// ============================================================================
+inline void SlicePairSpinMatrix(const LatticeFermion& f_l, const LatticeFermion& f_r,
+                                LatticeSpinColourMatrix& scm, LatticeSpinMatrix& smat,
+                                std::vector<SpinMatrix>& out)
+{
+  scm  = outerProduct(f_l, f_r);
+  smat = traceColour(scm);
+  sliceSum(smat, out, Tdir);
+}
+
+// SpinMatrix rep of a Gamma::Algebra element (identity trick; host/device scalar 4x4).
+inline SpinMatrix GammaMat(Gamma::Algebra g)
+{
+  SpinMatrix id;
+  id = 1.0;
+  SpinMatrix m = Gamma(g) * id;
+  return m;
+}
+
+// ============================================================================
+//  CHUNK-0 checkpoint pieces (conn_lma_impl_plan_claude.md). The v1 SaveEvecs/LoadEvecs
+//  above are UNCHANGED (v1 binary keeps compiling). New here:
+//    - SaveEvals: eval-only HDF5 checkpoint (tiny, boss-rank) -- production writes it ALWAYS
+//      (spectrum QA / window re-tuning offline; also the eval source for LoadEvecRecords).
+//    - SaveEvecRecords/LoadEvecRecords: Scidac evec records ONLY (evals live in the h5),
+//      prec 1=single (LatticeFermionF records, HALF the bytes+read time -- the D-IO default;
+//      consumer RR re-refines back to double) or 2=double (bit-faithful). Same rb-grid
+//      Scidac-record pattern as Hadrons EigenPack. Readout is only fast on a STRIPED dir:
+//      `lfs setstripe -c -1 -S 16M $EVEC_DIR` before first write (submit script's job).
+//  Precision is encoded in the FILENAME by the caller (.scidacf vs .scidac) so a prec
+//  mismatch on load is just a miss -> fall back to the eigensolve.
+// ============================================================================
+inline void SaveEvals(const std::string& eval_file, const std::vector<RealD>& eval_use,
+                      GridBase* grid)
+{
+  if(grid->IsBoss()){
+    int n = (int)eval_use.size();
+    std::vector<RealD> ev(eval_use);
+    Hdf5Writer EV(eval_file);
+    write(EV, "Nuse", n);
+    write(EV, "eval", ev);
+  }
+}
+
+// sub is non-const: Grid's writeScidacFieldRecord takes a non-const Lattice& (view machinery).
+inline void SaveEvecRecords(const std::string& evec_file, int prec, GridBase* FrbGrid_f,
+                            std::vector<LatticeFermion>& sub)
+{
+  emptyUserRecord record;
+  ScidacWriter WR(sub[0].Grid()->IsBoss());
+  WR.open(evec_file);
+  if(prec == 2){
+    for(int k=0; k<(int)sub.size(); k++) WR.writeScidacFieldRecord(sub[k], record);
+  } else {
+    LatticeFermionF tmp_f(FrbGrid_f);
+    for(int k=0; k<(int)sub.size(); k++){
+      precisionChange(tmp_f, sub[k]);
+      tmp_f.Checkerboard() = Odd;
+      WR.writeScidacFieldRecord(tmp_f, record);
+    }
+  }
+  WR.close();
+}
+
+inline bool LoadEvecRecords(const std::string& evec_file, const std::string& eval_file,
+                            int prec, GridBase* FrbGrid, GridBase* FrbGrid_f,
+                            std::vector<LatticeFermion>& sub, std::vector<RealD>& eval_use)
+{
+  std::ifstream t1(evec_file), t2(eval_file);
+  bool ok = t1.good() && t2.good();
+  t1.close(); t2.close();
+  if(!ok) return false;
+  int n = 0;
+  {
+    Hdf5Reader EV(eval_file);
+    read(EV, "Nuse", n);
+    read(EV, "eval", eval_use);
+  }
+  sub.clear();
+  sub.reserve(n);
+  for(int k=0; k<n; k++) sub.emplace_back(FrbGrid);
+  emptyUserRecord record;
+  ScidacReader RD;
+  RD.open(evec_file);
+  if(prec == 2){
+    for(int k=0; k<n; k++){
+      sub[k].Checkerboard() = Odd;
+      RD.readScidacFieldRecord(sub[k], record);
+    }
+  } else {
+    LatticeFermionF tmp_f(FrbGrid_f);
+    for(int k=0; k<n; k++){
+      tmp_f.Checkerboard() = Odd;
+      RD.readScidacFieldRecord(tmp_f, record);
+      sub[k].Checkerboard() = Odd;
+      precisionChange(sub[k], tmp_f);
+    }
   }
   RD.close();
   return true;
