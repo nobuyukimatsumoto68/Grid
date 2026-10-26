@@ -170,6 +170,18 @@ int main (int argc, char ** argv)
   std::string obsdir = "/mnt/baracuda_14/grid_claude/16c_obs";
   ParseArgs(argc, argv, mass, beta, dir, obsdir);
 
+  // ---- second (and further) noise hit: DISC_HIT=N>0 seeds the noise with cfg_path + "_hit<N>"
+  // (independent of hit 0) and writes into <obsdir>_hit<N>/ (same file names), so a hit-N run can
+  // never touch the hit-0 outputs. DISC_HIT unset/0 = original behaviour (same seed, same obsdir).
+  int disc_hit = 0;
+  if(const char* e = std::getenv("DISC_HIT")) disc_hit = std::atoi(e);
+  std::string hit_tag = "";
+  if(disc_hit > 0){
+    hit_tag = "_hit" + std::to_string(disc_hit);
+    while(obsdir.size() > 1 && obsdir.back() == '/') obsdir.pop_back();
+    obsdir = obsdir + hit_tag;
+  }
+
   const int Ls=16;
   Grid_init(&argc,&argv);
 
@@ -297,7 +309,8 @@ int main (int argc, char ** argv)
       const std::string path = dir+"/"+lat_prefix+std::to_string(conf);
       FieldMetaData header;
       NerscIO::readConfiguration(Umu, header, path);
-      RNG4.SeedUniqueString(path);
+      // RNG4.SeedUniqueString(path);
+      RNG4.SeedUniqueString(path + hit_tag);
     }
     // refresh the single-precision gauge copy for this config's inner solves.
     precisionChange(Umu_f, Umu);
