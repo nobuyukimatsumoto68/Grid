@@ -351,7 +351,9 @@ int main (int argc, char ** argv)
 //       RNG4.SeedUniqueString(path + seed_suffix);
 // =======
       // RNG4.SeedUniqueString(path);
-      RNG4.SeedUniqueString(path + hit_tag);
+      // RNG4.SeedUniqueString(path + hit_tag);
+      // both suffixes empty = original seed; DISC_SEED_STR (K-scan) and DISC_HIT compose
+      RNG4.SeedUniqueString(path + seed_suffix + hit_tag);
 // >>>>>>> bc333a071a0b8b682ab813caeee564f98f568183
     }
     // refresh the single-precision gauge copy for this config's inner solves.
