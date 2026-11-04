@@ -14,7 +14,8 @@
 
 set -u
 
-NPER=${NPER:-60}              # configs per job (4 GPUs); set from the debug timing
+# NPER=${NPER:-60}
+NPER=${NPER:-52}              # configs per job: debug 2026-11-04 ~955 s/config per GPU, 4 GPUs -> 13 per GPU in 4h
 WALL=${WALL:-240m}
 QUEUE=${QUEUE:-pbatch}
 ONLY=${ONLY:-}
