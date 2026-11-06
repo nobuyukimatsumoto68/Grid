@@ -44,6 +44,7 @@ CUR_START=$(grep -oP '(?<=<StartTrajectory>)[0-9]+' ${XML} | head -1); CUR_START
 if [ "${latest}" -gt 0 ]; then
     sed -i "/<StartTrajectory>/{s/>${CUR_START}</>${latest}</}" ${XML}
     sed -i "/<StartingType>/{s/HotStart/CheckpointStart/}" ${XML}
+    sed -i "/<StartingType>/{s/ColdStart/CheckpointStart/}" ${XML}     # heavy 32c streams were ColdStart (run_tuo.sh)
     sed -i "/<NoMetropolisUntil>/{s/>[0-9]*</>0</}" ${XML}
     echo "resume: latest checkpoint = ${latest} -> CheckpointStart"
 else
@@ -65,7 +66,9 @@ fi
 # estimate; the fixed TPT_SECONDS only bootstraps the FIRST job (no measurement yet).
 OVERHEAD_SECONDS=${OVERHEAD_SECONDS:-400}  # startup + final ckpt write + teardown margin
 MARGIN_NUM=${MARGIN_NUM:-12}               # 12/10 = 1.2x safety on the measured per-traj time
-measured=$(grep -hoE "Total time for trajectory \(s\): [0-9]+" hmc_prod_* 2>/dev/null | grep -oE "[0-9]+$" | sort -n | tail -n1)
+# ORIGINAL: measured=$(grep -hoE "Total time for trajectory \(s\): [0-9]+" hmc_prod_* 2>/dev/null | grep -oE "[0-9]+$" | sort -n | tail -n1)
+# also the logs of the original run_tuo.sh jobs (32c_<id>) of the heavy streams
+measured=$(grep -hoE "Total time for trajectory \(s\): [0-9]+" hmc_prod_* 32c_* 2>/dev/null | grep -oE "[0-9]+$" | sort -n | tail -n1)
 if [ -n "${measured}" ]; then
     TPT_SECONDS=$(( measured * MARGIN_NUM / 10 ))
     echo "blocker: measured per-traj (max, prior jobs this stream) = ${measured}s -> TPT=${TPT_SECONDS}s (x${MARGIN_NUM}/10)"
@@ -91,8 +94,12 @@ if [ ${CAP} -le ${latest} ]; then
     exit 0
 fi
 
-sed -i "/<Trajectories>/{s/>${CUR_TRAJ}</>${CAP}</}" ${XML}
-echo "this job: trajectories ${latest} -> ${CAP} (overall target ${TARGET})"
+# ORIGINAL (BUG: <Trajectories> is a COUNT of sweeps from StartTrajectory, Grid HMC.h:257, not an end point):
+# sed -i "/<Trajectories>/{s/>${CUR_TRAJ}</>${CAP}</}" ${XML}
+# echo "this job: trajectories ${latest} -> ${CAP} (overall target ${TARGET})"
+NRUN=$(( CAP - latest ))
+sed -i "/<Trajectories>/{s/>${CUR_TRAJ}</>${NRUN}</}" ${XML}
+echo "this job: run ${NRUN} trajectories (${latest} -> ${CAP}, overall target ${TARGET})"
 
 # ---- run ----
 flux run -N 8 --tasks-per-node=4 --verbose --exclusive --setopt=mpibind=verbose:1 $APP $PARAMS
