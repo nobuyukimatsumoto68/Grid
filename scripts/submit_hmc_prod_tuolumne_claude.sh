@@ -66,9 +66,10 @@ fi
 # estimate; the fixed TPT_SECONDS only bootstraps the FIRST job (no measurement yet).
 OVERHEAD_SECONDS=${OVERHEAD_SECONDS:-400}  # startup + final ckpt write + teardown margin
 MARGIN_NUM=${MARGIN_NUM:-12}               # 12/10 = 1.2x safety on the measured per-traj time
-# ORIGINAL: measured=$(grep -hoE "Total time for trajectory \(s\): [0-9]+" hmc_prod_* 2>/dev/null | grep -oE "[0-9]+$" | sort -n | tail -n1)
-# also the logs of the original run_tuo.sh jobs (32c_<id>) of the heavy streams
-measured=$(grep -hoE "Total time for trajectory \(s\): [0-9]+" hmc_prod_* 32c_* 2>/dev/null | grep -oE "[0-9]+$" | sort -n | tail -n1)
+measured=$(grep -hoE "Total time for trajectory \(s\): [0-9]+" hmc_prod_* 2>/dev/null | grep -oE "[0-9]+$" | sort -n | tail -n1)
+# REVERTED 2026-11-09 (user): also reading the old run_tuo.sh logs (32c_<id>) took their slower max (m0.1 340 s vs
+# 250 s now) and halved the trajectories per job; only this stream's hmc_prod_* logs are used again:
+# measured=$(grep -hoE "Total time for trajectory \(s\): [0-9]+" hmc_prod_* 32c_* 2>/dev/null | grep -oE "[0-9]+$" | sort -n | tail -n1)
 if [ -n "${measured}" ]; then
     TPT_SECONDS=$(( measured * MARGIN_NUM / 10 ))
     echo "blocker: measured per-traj (max, prior jobs this stream) = ${measured}s -> TPT=${TPT_SECONDS}s (x${MARGIN_NUM}/10)"
