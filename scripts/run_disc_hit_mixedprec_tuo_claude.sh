@@ -19,6 +19,13 @@ builddir=/usr/workspace/lsd/matsumoto5/su4_32c/build
 script=submit_disc_mixedprec_tuolumne_claude.sh
 
 DISC_HIT=${DISC_HIT:-1}
+# optional wall override (default = the submit script's #FLUX -t 480m). Random mid-job hangs (2026-11-07..09, m0.4:
+# 3-15 configs then a stall until the wall) make shorter walls cheaper, e.g. WALL=240m. Done configs are skipped.
+WALL=${WALL:-}
+walltime=""
+if [ -n "${WALL}" ]; then
+    walltime="-t ${WALL}"
+fi
 ONLY=${ONLY:-}               # empty = all; 0 = m0.1, 1 = m0.2, 2 = m0.3, 3 = m0.4
 
 masses=(0.1     0.2     0.3     0.4)
@@ -60,7 +67,8 @@ for((j=0;j<$jmax;j++)); do
     fi
 
     echo "submitting ${cfgfilename} hit ${DISC_HIT} as ${jobname}${deps:+ (deps:${deps# })}"
-    flux batch --job-name=${jobname} ${deps} \
+    # flux batch --job-name=${jobname} ${deps} \
+    flux batch --job-name=${jobname} ${deps} ${walltime} \
         --env=builddir=$builddir --env=mass=$mass --env=beta=$beta \
         --env=latdir=$latdir --env=obsdir=$obsdir --env=DISC_HIT=${DISC_HIT} $script
 done
